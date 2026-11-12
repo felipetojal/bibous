@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package masterdrive;
+
+option go_package = "github.com/felipetojal/bibous/gen/pb;pb";
+
+service MasterService {
+    rpc Heartbeat(HeartbeatRequest)
+        returns (HeartbeatResponse);
+
+    rpc RegisterNode(RegisterRequest)
+        returns (RegisterResponse);
+}
+
+message HeartbeatRequest {
+    string node_id = 1;
+    uint64 nonce = 2;
+}
+
+message HeartbeatResponse {
+    string node_id = 1;
+    uint64 nonce = 2;
+}
+
+message RegisterRequest {
+    string node_id = 1;
+    string node_address = 2;
+    uint64 available_size = 3;
+    uint64 total_size = 4;
+}
+
+message RegisterResponse {
+    string node_id = 1;
+    bool success = 2;
+}
