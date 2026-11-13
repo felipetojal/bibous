@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
-	storage "sistemasDistribuidos/bibous/internal/storage/config"
+
+	"github.com/felipetojal/bibous/internal/storage"
 )
 
 func PrepareDataDir(dir string) (err error) {
