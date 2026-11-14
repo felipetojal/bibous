@@ -1,10 +1,8 @@
 package storage
 
 import (
-	"log"
 	"errors"
 	"github.com/caarlos0/env/v11"
-	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -16,10 +14,6 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error){
-
-	if err := godotenv.Load(".env"); err != nil {
-		log.Fatalf("carragar .env: %v", err)
-	}
 
 	cfg, err := env.ParseAs[Config]()
 

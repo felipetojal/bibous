@@ -1,50 +1,60 @@
 package main
 
 import (
-	"errors"
+	"bytes"
 	"fmt"
 	"log"
-	"os"
 
 	"github.com/felipetojal/bibous/internal/storage"
+	"github.com/joho/godotenv"
 )
 
-func PrepareDataDir(dir string) (err error) {
-	if err := os.MkdirAll(dir,0750); err != nil {
-		return fmt.Errorf("criar diretorio")
-	}
-
-	f , err := os.CreateTemp(dir, "write-check")
-	if err != nil {
-		return fmt.Errorf("Criar temporario")
-	}
-
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("fechar temporario"))
-		}
-
-		if removeErr := os.Remove(f.Name()); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("remover temporario"))
-		}
-	}()
-
-	if _, err := f.Write([]byte("write-check")); err != nil {
-		return fmt.Errorf("escrever temporario")
-	}
-
-	return nil
-}
 
 func main(){
+
+	if err := godotenv.Load(".env"); err != nil {
+		log.Fatalf("carragar .env: %v", err)
+	}
+
 	cfg, err := storage.LoadConfig()
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := PrepareDataDir(cfg.DataDir); err != nil {
+	str, err := storage.NewStore(cfg.DataDir)
+
+	if err != nil {
 		log.Fatal(err)
 	}
+
+	bt := []byte("first block")
+  blk, err := storage.CreateBlock("B1", 1, bt)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := str.SaveBlock(blk, bt); err != nil {
+		log.Fatal(err)
+	}
+	
+	if blk.State != storage.VALID {
+		fmt.Printf("Estado incorreto: %v", blk.State)
+	}
+
+	fmt.Printf("Blk salvo %s", blk.BlockID)
+
+	byt, err := str.ReadBlock(blk)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if !bytes.Equal(bt, byt) {
+		fmt.Printf("bytes diferentes")
+	}
+	
+	fmt.Printf("Tudo ok")
 
 }
