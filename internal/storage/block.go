@@ -19,7 +19,7 @@ const (
 type Block struct {
 	BlockID string
 	Size    int64
-	Versao  int
+	Version  int
 	State   Estado
 	Hash    string
 }
@@ -42,7 +42,7 @@ func CreateBlock(id string, versao int, data []byte) (*Block, error) {
 	return &Block{
 		BlockID: id,
 		Size:    int64(len(data)),
-		Versao:  versao,
+		Version:  versao,
 		State:   WRITING,
 		Hash:    hex.EncodeToString(hash[:]),
 	}, nil

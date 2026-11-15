@@ -11,11 +11,17 @@ import (
 	"sync"
 )
 
+type BlockKey struct {
+	BlockID string
+	Version int
+}
 
 // Grava e lê blocos no disco
 type Store struct {
-	dataDir string
-	mu      sync.Mutex
+	DataDir        string
+	blocks         map[BlockKey]Block
+	persistenceErr error
+	mu             sync.Mutex
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -33,9 +39,16 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("criar diretorio %q: %w", absDir, err)
 	}
 
-	return &Store{
-		dataDir: absDir,
-	}, nil 
+	s := &Store{
+		DataDir: absDir,
+		blocks:  make(map[BlockKey]Block),
+	}
+
+	if err := s.loadSnapshot(); err != nil {
+		return nil, err
+	}
+
+	return s, nil
 
 }
 
@@ -48,12 +61,12 @@ func (s *Store) blockPath(b *Block) (string, error) {
 		return "", errors.New("BlockID invalido")
 	}
 
-	if b.Versao < 1 {
+	if b.Version < 1 {
 		return "", errors.New("Versao invalida")
 	}
 
-	name := b.BlockID + "-v" + strconv.Itoa(b.Versao) + ".blk"
-	return filepath.Join(s.dataDir,name), nil
+	name := b.BlockID + "-v" + strconv.Itoa(b.Version) + ".blk"
+	return filepath.Join(s.DataDir,name), nil
 }
 
 func validateContent(b *Block, data []byte) error {
@@ -76,6 +89,13 @@ func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.persistenceErr != nil {
+		return fmt.Errorf(
+			"storage bloqueado após falha de persistência: %w",
+			s.persistenceErr,
+		)
+	}
+
 	// pega o path do bloco
 	path, err := s.blockPath(b)
 	if err != nil {
@@ -85,6 +105,46 @@ func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 	// valida o bloco
 	if err := validateContent(b, data); err != nil {
 		return err
+	}
+
+	key := BlockKey{
+	BlockID: b.BlockID,
+	Version:  b.Version,
+	}
+
+
+	if existing, ok := s.blocks[key]; ok {
+		if existing.Size != b.Size || existing.Hash != b.Hash {
+			return fmt.Errorf(
+				"conflito: bloco %s versão %d já possui outro conteúdo",
+				b.BlockID, b.Version,
+			)
+		}
+
+		if existing.State != VALID {
+			return fmt.Errorf(
+				"bloco %s versão %d não está VALID",
+				b.BlockID, b.Version,
+			)
+		}
+
+		// Confere a réplica antes de aceitar uma repetição.
+		storedData, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("ler réplica existente: %w", err)
+		}
+
+		if err := validateContent(&existing, storedData); err != nil {
+			existing.State = CORRUPT
+			persistErr := s.persistBlockLocked(existing)
+			return errors.Join(
+				fmt.Errorf("réplica existente corrompida: %w", err),
+				persistErr,
+			)
+		}
+
+		b.State = VALID
+		return nil
 	}
 
 	// verifica se ja existe um path
@@ -97,7 +157,7 @@ func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 	b.State = WRITING
 
 	// Mesmo diretório: temporário e destino ficam no mesmo filesystem
-	f, err := os.CreateTemp(s.dataDir, ".upload-*")
+	f, err := os.CreateTemp(s.DataDir, ".upload-*")
 	if err != nil {
 		return fmt.Errorf("criar temporário: %w", err)
 	}
@@ -145,7 +205,7 @@ func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 	}
 	published = true
 
-	dir, err := os.Open(s.dataDir)
+	dir, err := os.Open(s.DataDir)
 	if err != nil {
 		return fmt.Errorf("abrir diretório para sincronização: %w", err)
 	}
@@ -156,21 +216,44 @@ func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 		return fmt.Errorf("persistir publicação do bloco: %w", err)
 	}
 
+	committed := *b
+	committed.State = VALID
+
+	if err := s.persistBlockLocked(committed); err != nil {
+		return err
+	}
+
 	b.State = VALID
 	return nil
 }
 
-func (s *Store) ReadBlock(b *Block) ([]byte, error) {
+func (s *Store) ReadBlock(id string, versao int) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path, err := s.blockPath(b)
-	if err != nil {
-		return nil, err
+	key := BlockKey{
+		BlockID: id,
+		Version:  versao,
+	}
+
+	b, ok := s.blocks[key]
+	if !ok {
+		return nil, fmt.Errorf(
+			"bloco %s versão %d não encontrado no inventário",
+			id, versao,
+		)
 	}
 
 	if b.State != VALID {
-		return nil, fmt.Errorf("bloco não está VALID: %s", b.BlockID)
+		return nil, fmt.Errorf(
+			"bloco %s versão %d não está VALID",
+			id, versao,
+		)
+	}
+
+	path, err := s.blockPath(&b)
+	if err != nil {
+		return nil, err
 	}
 
 	data, err := os.ReadFile(path)
@@ -178,9 +261,16 @@ func (s *Store) ReadBlock(b *Block) ([]byte, error) {
 		return nil, fmt.Errorf("ler bloco: %w", err)
 	}
 
-	if err := validateContent(b, data); err != nil {
+	if err := validateContent(&b, data); err != nil {
 		b.State = CORRUPT
-		return nil, fmt.Errorf("bloco %s corrompido: %w", b.BlockID, err)
+		persistErr := s.persistBlockLocked(b)
+		return nil, errors.Join(
+			fmt.Errorf(
+				"bloco %s versão %d corrompido: %w",
+				id, versao, err,
+			),
+			persistErr,
+		)
 	}
 
 	return data, nil

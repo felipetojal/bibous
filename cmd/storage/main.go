@@ -1,60 +1,84 @@
 package main
 
 import (
-	"bytes"
-	"fmt"
+	"errors"
 	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	pb "github.com/felipetojal/bibous/proto"
 	"github.com/felipetojal/bibous/internal/storage"
 	"github.com/joho/godotenv"
+
+	"google.golang.org/grpc"
 )
 
-
-func main(){
-
-	if err := godotenv.Load(".env"); err != nil {
-		log.Fatalf("carragar .env: %v", err)
+func main() {
+	// O .env é opcional quando as variáveis já vêm do ambiente.
+	if err := godotenv.Load(".env"); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("carregar .env: %v", err)
 	}
 
 	cfg, err := storage.LoadConfig()
-
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	str, err := storage.NewStore(cfg.DataDir)
-
+	store, err := storage.NewStore(cfg.DataDir)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("inicializar armazenamento: %v", err)
 	}
 
-	bt := []byte("first block")
-  blk, err := storage.CreateBlock("B1", 1, bt)
-
+	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("escutar em %s: %v", cfg.Listen, err)
 	}
 
-	if err := str.SaveBlock(blk, bt); err != nil {
-		log.Fatal(err)
+	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(storage.MaxRPCMessageBytes),
+		grpc.MaxSendMsgSize(storage.MaxRPCMessageBytes),
+	)
+
+	pb.RegisterStorageServiceServer(
+		server,
+		storage.NewRPCServer(store, cfg.NodeId),
+	)
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	go func() {
+		<-signals
+		log.Print("encerrando servidor")
+
+		done := make(chan struct{})
+
+		go func() {
+			server.GracefulStop()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			server.Stop()
+		}
+	}()
+
+	log.Printf(
+		"storage iniciado node=%s address=%s data_dir=%s",
+		cfg.NodeId,
+		listener.Addr(),
+		store.DataDir,
+	)
+
+	if err := server.Serve(listener); err != nil &&
+		!errors.Is(err, grpc.ErrServerStopped) {
+		log.Fatalf("servidor gRPC: %v", err)
 	}
-	
-	if blk.State != storage.VALID {
-		fmt.Printf("Estado incorreto: %v", blk.State)
-	}
-
-	fmt.Printf("Blk salvo %s", blk.BlockID)
-
-	byt, err := str.ReadBlock(blk)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if !bytes.Equal(bt, byt) {
-		fmt.Printf("bytes diferentes")
-	}
-	
-	fmt.Printf("Tudo ok")
-
 }
