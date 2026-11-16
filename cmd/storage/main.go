@@ -2,49 +2,83 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	pb "github.com/felipetojal/bibous/proto"
 	"github.com/felipetojal/bibous/internal/storage"
+	"github.com/joho/godotenv"
+
+	"google.golang.org/grpc"
 )
 
-func PrepareDataDir(dir string) (err error) {
-	if err := os.MkdirAll(dir,0750); err != nil {
-		return fmt.Errorf("criar diretorio")
+func main() {
+	// O .env é opcional quando as variáveis já vêm do ambiente.
+	if err := godotenv.Load(".env"); err != nil &&
+		!errors.Is(err, os.ErrNotExist) {
+		log.Fatalf("carregar .env: %v", err)
 	}
 
-	f , err := os.CreateTemp(dir, "write-check")
+	cfg, err := storage.LoadConfig()
 	if err != nil {
-		return fmt.Errorf("Criar temporario")
+		log.Fatal(err)
 	}
 
-	defer func() {
-		if closeErr := f.Close(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("fechar temporario"))
-		}
+	store, err := storage.NewStore(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("inicializar armazenamento: %v", err)
+	}
 
-		if removeErr := os.Remove(f.Name()); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("remover temporario"))
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		log.Fatalf("escutar em %s: %v", cfg.Listen, err)
+	}
+
+	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(storage.MaxRPCMessageBytes),
+		grpc.MaxSendMsgSize(storage.MaxRPCMessageBytes),
+	)
+
+	pb.RegisterStorageServiceServer(
+		server,
+		storage.NewRPCServer(store, cfg.NodeId),
+	)
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	go func() {
+		<-signals
+		log.Print("encerrando servidor")
+
+		done := make(chan struct{})
+
+		go func() {
+			server.GracefulStop()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			server.Stop()
 		}
 	}()
 
-	if _, err := f.Write([]byte("write-check")); err != nil {
-		return fmt.Errorf("escrever temporario")
+	log.Printf(
+		"storage iniciado node=%s address=%s data_dir=%s",
+		cfg.NodeId,
+		listener.Addr(),
+		store.DataDir,
+	)
+
+	if err := server.Serve(listener); err != nil &&
+		!errors.Is(err, grpc.ErrServerStopped) {
+		log.Fatalf("servidor gRPC: %v", err)
 	}
-
-	return nil
-}
-
-func main(){
-	cfg, err := storage.LoadConfig()
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := PrepareDataDir(cfg.DataDir); err != nil {
-		log.Fatal(err)
-	}
-
 }
