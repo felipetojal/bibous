@@ -1,24 +1,18 @@
 syntax = "proto3";
-
 package storage.v1;
-
-option go_package = "github.com/felipetojal/bibous/api/storage/v1;storagepb";
-
+option go_package = "github.com/felipetojal/bibous/proto;storagepb";
 service StorageService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc PutBlock(PutRequest) returns (PutResponse);
   rpc GetBlock(GetRequest) returns (GetResponse);
+  rpc DeleteBlock(DeleteRequest) returns (DeleteResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Scrub(ScrubRequest) returns (ScrubResponse);
+  // Os bytes seguem do storage de origem diretamente para o destino.
+  rpc CopyBlock(CopyRequest) returns (PutResponse);
 }
-
-message HeartbeatRequest {
-  uint64 nonce = 1;
-}
-
-message HeartbeatResponse {
-  string node_id = 1;
-  uint64 nonce = 2;
-}
-
+message HeartbeatRequest { uint64 nonce = 1; }
+message HeartbeatResponse { string node_id = 1; uint64 nonce = 2; }
 message PutRequest {
   string operation_id = 1;
   string block_id = 2;
@@ -27,7 +21,6 @@ message PutRequest {
   string hash = 5;
   bytes data = 6;
 }
-
 message PutResponse {
   string node_id = 1;
   string block_id = 2;
@@ -35,16 +28,43 @@ message PutResponse {
   int64 size = 4;
   string hash = 5;
 }
-
-message GetRequest {
-  string block_id = 1;
-  int64 version = 2;
-}
-
+message GetRequest { string block_id = 1; int64 version = 2; }
 message GetResponse {
   string block_id = 1;
   int64 version = 2;
   int64 size = 3;
   string hash = 4;
   bytes data = 5;
+}
+message DeleteRequest {
+  string operation_id = 1;
+  string block_id = 2;
+  int64 version = 3;
+}
+message DeleteResponse { string node_id = 1; }
+message StatusRequest {}
+message StatusResponse {
+  string node_id = 1;
+  uint64 valid_blocks = 2;
+  uint64 corrupt_blocks = 3;
+  uint64 writing_blocks = 4;
+  uint64 deleting_blocks = 5;
+  uint64 deleted_blocks = 6;
+  uint64 valid_bytes = 7;
+  uint64 free_bytes = 8;
+  bool writable = 9;
+  string error = 10;
+}
+message ScrubRequest { string operation_id = 1; }
+message ScrubResponse {
+  string node_id = 1;
+  uint64 checked = 2;
+  uint64 corrupt = 3;
+}
+message CopyRequest {
+  string operation_id = 1;
+  string block_id = 2;
+  int64 version = 3;
+  // Resolvido usando PEERS do servidor; não aceita caminho nem endereço livre.
+  string target_node_id = 4;
 }

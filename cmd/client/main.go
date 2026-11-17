@@ -1,142 +1,114 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	pb "github.com/felipetojal/bibous/proto"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/felipetojal/bibous/internal/client"
 )
-
-const maxMessageBytes = 4*1024*1024 + 64*1024
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		os.Exit(1)
 	}
 }
-
 func run() error {
-	address := flag.String("addr", "localhost:8081", "endereço do storage")
-	blockID := flag.String("id", "B1", "ID do bloco")
-	version := flag.Int64("version", 1, "versão do bloco")
-	getOnly := flag.Bool("get-only", false, "executar somente download")
-	flag.Parse()
-
-	conn, err := grpc.NewClient(
-		*address,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxMessageBytes),
-			grpc.MaxCallSendMsgSize(maxMessageBytes),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("criar cliente: %w", err)
+	if len(os.Args) < 2 {
+		return fmt.Errorf("use put|get|delete|repair|status|scrub; consulte README.md")
 	}
-	defer conn.Close()
-
-	client := pb.NewStorageServiceClient(conn)
-
-	// 1. Verificar se o nó responde.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	health, err := client.Heartbeat(ctx, &pb.HeartbeatRequest{
-		Nonce: 123,
-	})
-	cancel()
-
-	if err != nil {
-		return fmt.Errorf("heartbeat: %w", err)
+	command := os.Args[1]
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	nodesPath := flags.String("nodes", "nodes.json", "configuração dos três nós")
+	manifest := flags.String("manifest", "", "manifesto JSON")
+	input := flags.String("file", "", "arquivo para upload")
+	output := flags.String("out", "", "arquivo de saída")
+	nodeID := flags.String("node", "", "ID opcional para status/scrub")
+	target := flags.String("target", "", "ID do nó para repair")
+	timeout := flags.Duration("timeout", 10*time.Second, "limite por tentativa RPC")
+	if err := flags.Parse(os.Args[2:]); err != nil {
+		return err
 	}
-
-	if health.GetNonce() != 123 || health.GetNodeId() == "" {
-		return fmt.Errorf("resposta de heartbeat inválida")
+	if flags.NArg() != 0 || *timeout <= 0 {
+		return fmt.Errorf("argumentos inválidos")
 	}
-
-	log.Printf("conectado ao nó %s", health.GetNodeId())
-
-	data := []byte("first block")
-	sum := sha256.Sum256(data)
-	expectedHash := hex.EncodeToString(sum[:])
-
-	// 2. Enviar o bloco.
-	if !*getOnly {
-		var randomID [16]byte
-		if _, err := rand.Read(randomID[:]); err != nil {
-			return fmt.Errorf("gerar ID da operação: %w", err)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	c := client.Client{Timeout: *timeout}
+	switch command {
+	case "put":
+		if *input == "" || *manifest == "" {
+			return fmt.Errorf("put exige -file e -manifest")
 		}
-
-		operationID := hex.EncodeToString(randomID[:])
-
-		ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-		ack, err := client.PutBlock(ctx, &pb.PutRequest{
-			OperationId: operationID,
-			BlockId:     *blockID,
-			Version:     *version,
-			Size:        int64(len(data)),
-			Hash:        expectedHash,
-			Data:        data,
-		})
-		cancel()
-
+		nodes, err := client.LoadNodes(*nodesPath)
 		if err != nil {
-			return fmt.Errorf("put: %w", err)
+			return err
 		}
-
-		if ack.GetNodeId() != health.GetNodeId() ||
-			ack.GetBlockId() != *blockID ||
-			ack.GetVersion() != *version ||
-			ack.GetSize() != int64(len(data)) ||
-			ack.GetHash() != expectedHash {
-			return fmt.Errorf("ACK não corresponde ao bloco enviado")
+		if err = c.Upload(ctx, *input, *manifest, nodes); err != nil {
+			return err
 		}
-
-		log.Printf("upload confirmado: bloco=%s", ack.GetBlockId())
+	case "get":
+		if *manifest == "" || *output == "" {
+			return fmt.Errorf("get exige -manifest e -out")
+		}
+		if err := c.Download(ctx, *manifest, *output); err != nil {
+			return err
+		}
+	case "delete":
+		if *manifest == "" {
+			return fmt.Errorf("delete exige -manifest")
+		}
+		if err := c.Delete(ctx, *manifest); err != nil {
+			return err
+		}
+	case "repair":
+		if *manifest == "" || *target == "" {
+			return fmt.Errorf("repair exige -manifest e -target")
+		}
+		if err := c.Repair(ctx, *manifest, *target); err != nil {
+			return err
+		}
+	case "status", "scrub":
+		nodes, err := client.LoadNodes(*nodesPath)
+		if err != nil {
+			return err
+		}
+		var failures []error
+		found := *nodeID == ""
+		for _, n := range nodes {
+			if *nodeID != "" && n.NodeID != *nodeID {
+				continue
+			}
+			found = true
+			var result any
+			if command == "status" {
+				result, err = c.Status(ctx, n)
+			} else {
+				result, err = c.Scrub(ctx, n)
+			}
+			if err != nil {
+				failures = append(failures, fmt.Errorf("%s: %w", n.NodeID, err))
+				continue
+			}
+			if err = json.NewEncoder(os.Stdout).Encode(result); err != nil {
+				return err
+			}
+		}
+		if !found {
+			return fmt.Errorf("nó não consta em nodes.json: %s", *nodeID)
+		}
+		return errors.Join(failures...)
+	default:
+		return fmt.Errorf("comando desconhecido: %s", command)
 	}
-
-	// 3. Recuperar o bloco.
-	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-	response, err := client.GetBlock(ctx, &pb.GetRequest{
-		BlockId: *blockID,
-		Version: *version,
-	})
-	cancel()
-
-	if err != nil {
-		return fmt.Errorf("get: %w", err)
-	}
-
-	if response.GetBlockId() != *blockID ||
-		response.GetVersion() != *version ||
-		response.GetSize() != int64(len(data)) {
-		return fmt.Errorf("metadados do download divergentes")
-	}
-
-	receivedSum := sha256.Sum256(response.GetData())
-	receivedHash := hex.EncodeToString(receivedSum[:])
-
-	if receivedHash != expectedHash ||
-		response.GetHash() != expectedHash {
-		return fmt.Errorf("hash do download divergente")
-	}
-
-	if !bytes.Equal(data, response.GetData()) {
-		return fmt.Errorf("conteúdo baixado diferente do original")
-	}
-
-	log.Printf(
-		"SUCESSO: bloco=%s versão=%d conteúdo=%q",
-		*blockID, *version, response.GetData(),
-	)
-
+	fmt.Println(command + " concluído")
 	return nil
 }
