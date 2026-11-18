@@ -1,35 +1,165 @@
 syntax = "proto3";
 
 package masterdrive;
+option go_package = "github.com/felipetojal/bibous/proto/masterpb;masterpb";
 
-option go_package = "github.com/felipetojal/bibous/gen/pb;pb";
-
+// O mestre coordena metadados e nós. O conteúdo dos arquivos deve trafegar
+// diretamente entre cliente e armazenamento; o protocolo atual de armazenamento
+// exige uma exceção temporária para verificar e recuperar réplicas.
 service MasterService {
-    rpc Heartbeat(HeartbeatRequest)
-        returns (HeartbeatResponse);
-
-    rpc RegisterNode(RegisterRequest)
-        returns (RegisterResponse);
+  // Recebe sinais de vida e a capacidade disponível do armazenamento.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Descobre um nó novo ou reiniciado sem editar configuração do mestre.
+  rpc RegisterNode(RegisterRequest) returns (RegisterResponse);
+  // Reserva destinos para os blocos antes de receber qualquer conteúdo.
+  rpc PrepareUpload(PrepareUploadRequest) returns (PrepareUploadResponse);
+  // Publica o arquivo depois de validar todas as réplicas.
+  rpc CommitUpload(CommitUploadRequest) returns (CommitUploadResponse);
+  // Libera uma reserva de upload que não será confirmada.
+  rpc AbortUpload(AbortUploadRequest) returns (SimpleResponse);
+  // Informa ao cliente onde buscar os blocos e quais hashes verificar.
+  rpc GetFileMetadata(GetFileRequest) returns (GetFileResponse);
+  // Exclui a entrada lógica; o armazenamento atual não implementa DeleteBlock.
+  rpc DeleteFile(FilePathRequest) returns (SimpleResponse);
+  // Altera o caminho lógico sem transferir novamente os blocos.
+  rpc MoveFile(MoveFileRequest) returns (SimpleResponse);
+  // Acrescenta um diretório ao espaço de nomes do mestre.
+  rpc CreateDirectory(DirectoryRequest) returns (SimpleResponse);
+  // Exclui apenas diretórios vazios.
+  rpc DeleteDirectory(DirectoryRequest) returns (SimpleResponse);
+  // Lista as entradas imediatas de um diretório.
+  rpc ListDirectory(DirectoryRequest) returns (ListDirectoryResponse);
+  // Exibe nós, capacidade e condições dos arquivos.
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // Marca uma réplica denunciada como inválida para recuperação.
+  rpc ReportCorruption(CorruptionReport) returns (SimpleResponse);
+  // Impede novas alocações em um nó que será desligado.
+  rpc DrainNode(DrainNodeRequest) returns (SimpleResponse);
 }
 
+// Campos e identificadores preservados para manter compatibilidade.
 message HeartbeatRequest {
-    string node_id = 1;
-    uint64 nonce = 2;
+  string node_id = 1;
+  uint64 nonce = 2;
+  optional uint64 available_size = 3;
 }
 
 message HeartbeatResponse {
-    string node_id = 1;
-    uint64 nonce = 2;
+  string node_id = 1;
+  uint64 nonce = 2;
 }
 
 message RegisterRequest {
-    string node_id = 1;
-    string node_address = 2;
-    uint64 available_size = 3;
-    uint64 total_size = 4;
+  string node_id = 1;
+  string node_address = 2;
+  uint64 available_size = 3;
+  uint64 total_size = 4;
+  string machine_id = 5;
+  string disk_id = 6;
 }
 
 message RegisterResponse {
-    string node_id = 1;
-    bool success = 2;
+  string node_id = 1;
+  bool success = 2;
+}
+
+// BlockSpec declara o hash e o tamanho de um bloco antes do envio.
+message BlockSpec {
+  uint64 size = 1;
+  string sha256 = 2;
+}
+
+message PrepareUploadRequest {
+  string path = 1;
+  uint64 size = 2;
+  string sha256 = 3;
+  uint32 replication_factor = 4; // zero utiliza o padrão configurado
+  repeated BlockSpec blocks = 5; // limite de 4 MiB por bloco
+}
+
+// NodeEndpoint descreve a localização física de uma réplica.
+message NodeEndpoint {
+  string node_id = 1;
+  string address = 2;
+  string machine_id = 3;
+  string disk_id = 4;
+}
+
+// BlockPlacement associa um bloco aos destinos escolhidos pelo mestre.
+message BlockPlacement {
+  string block_id = 1;
+  int64 version = 2;
+  uint64 size = 3;
+  string sha256 = 4;
+  repeated NodeEndpoint replicas = 5;
+}
+
+message PrepareUploadResponse {
+  string upload_id = 1;
+  int64 expires_unix = 2;
+  repeated BlockPlacement blocks = 3;
+}
+message CommitUploadRequest { string upload_id = 1; }
+
+message CommitUploadResponse { FileInfo file = 1; }
+
+message AbortUploadRequest { string upload_id = 1; }
+
+message SimpleResponse { bool success = 1; }
+
+message GetFileRequest { string path = 1; }
+
+message GetFileResponse { FileInfo file = 1; }
+
+message FilePathRequest { string path = 1; }
+
+message MoveFileRequest { string source = 1; string destination = 2; }
+
+message DirectoryRequest { string path = 1; }
+
+message ListDirectoryResponse {
+  repeated string directories = 1;
+  repeated string files = 2;
+}
+
+// FileInfo representa os metadados públicos de um arquivo confirmado.
+message FileInfo {
+  string path = 1;
+  uint64 size = 2;
+  string sha256 = 3;
+  uint32 replication_factor = 4;
+  int64 created_unix = 5;
+  int64 updated_unix = 6;
+  string status = 7;
+  repeated BlockPlacement blocks = 8;
+}
+
+message ClusterStatusRequest {}
+
+// NodeState reúne a situação de cada nó para observabilidade.
+message NodeState {
+  string node_id = 1;
+  string address = 2;
+  string machine_id = 3;
+  string disk_id = 4;
+  uint64 available_size = 5;
+  uint64 total_size = 6;
+  int64 last_heartbeat_unix = 7;
+  string status = 8;
+}
+
+message ClusterStatusResponse {
+  repeated NodeState nodes = 1;
+  uint64 healthy_files = 2;
+  uint64 under_replicated_files = 3;
+  uint64 unavailable_files = 4;
+  uint64 pending_uploads = 5;
+}
+
+message DrainNodeRequest { string node_id = 1; }
+
+message CorruptionReport {
+  string node_id = 1;
+  string block_id = 2;
+  int64 version = 3;
 }
