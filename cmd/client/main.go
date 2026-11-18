@@ -71,6 +71,7 @@ func run() error {
 	timeout := global.Duration("timeout", 30*time.Second, "timeout de cada chamada RPC")
 	retries := global.Int("retries", 2, "novas tentativas por nó em falhas transitórias")
 	quiet := global.Bool("q", false, "não mostrar progresso")
+	encKey := global.String("key", "", "chave de criptografia AES-256 (32 caracteres)")
 	global.Usage = func() {
 		fmt.Fprint(global.Output(), usage)
 		global.PrintDefaults()
@@ -95,6 +96,7 @@ func run() error {
 	cfg := client.Config{
 		MasterAddr:        *master,
 		BlockSize:         *blockSize,
+		EncryptionKey:     []byte(*encKey),
 		ReplicationFactor: uint32(*replication),
 		Parallelism:       *parallel,
 		MinReplicas:       *minReplicas,
