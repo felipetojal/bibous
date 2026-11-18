@@ -1,6 +1,6 @@
 // Package client implementa o lado cliente do Bibous: divide arquivos em
-// blocos, consulta o mestre para saber onde gravar/ler cada bloco e
-// transfere os bytes diretamente com os nós de armazenamento.
+// blocos, consulta o mestre (MasterService) para saber onde gravar/ler cada
+// bloco e transfere os bytes diretamente com os nós de armazenamento.
 package client
 
 import (
@@ -10,14 +10,15 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/felipetojal/bibous/proto"
+	storagepb "github.com/felipetojal/bibous/proto"
+	mpb "github.com/felipetojal/bibous/proto/masterpb"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
-	// MaxBlockSize é o maior bloco aceito pelo StorageService.PutBlock.
+	// MaxBlockSize é o maior bloco aceito pelo storage e pelo mestre.
 	MaxBlockSize = 4 * 1024 * 1024
 	// DefaultBlockSize é usado quando Config.BlockSize é zero.
 	DefaultBlockSize = MaxBlockSize
@@ -28,10 +29,11 @@ const (
 
 // Config controla o comportamento do cliente.
 type Config struct {
-	// MasterAddr é o host:porta do ClientService no mestre.
+	// MasterAddr é o host:porta do MasterService.
 	MasterAddr string
 
-	// BlockSize é o tamanho dos blocos no upload (padrão: 4 MiB).
+	// BlockSize é o tamanho dos blocos (do texto claro) no upload.
+	// Padrão: 4 MiB, ou 4 MiB menos a sobrecarga da cifra se houver chave.
 	BlockSize int64
 
 	// ReplicationFactor pedido ao mestre (0 = padrão do mestre).
@@ -40,13 +42,12 @@ type Config struct {
 	// Parallelism é o número de blocos transferidos ao mesmo tempo.
 	Parallelism int
 
-	// MinReplicas é o mínimo de réplicas que precisam confirmar cada bloco
-	// para o upload ser aceito (padrão: 1). O mestre recebe no commit a lista
-	// das réplicas que confirmaram e pode re-replicar as que faltaram.
-	MinReplicas int
-
 	// RPCTimeout é o limite de cada chamada a um nó ou ao mestre.
 	RPCTimeout time.Duration
+
+	// CommitTimeout é o limite do CommitUpload, em que o mestre relê
+	// todas as réplicas para conferir os hashes (padrão: 2 minutos).
+	CommitTimeout time.Duration
 
 	// Retries é o número de tentativas extras por réplica em falhas
 	// transitórias (Unavailable, DeadlineExceeded...).
@@ -55,25 +56,32 @@ type Config struct {
 	// Progress, se não for nil, é chamado a cada bloco concluído.
 	Progress func(done, total int)
 
-	// Chave AES-256 (32 bytes). Se vazia, criptografia desligada.
+	// EncryptionKey é a chave AES-256 (32 bytes). Vazia = sem criptografia.
+	// A cifra acontece no cliente: nós e mestre só veem texto cifrado.
 	EncryptionKey []byte
+}
+
+func (c *Config) encrypted() bool { return len(c.EncryptionKey) > 0 }
+
+func (c *Config) maxPlainBlock() int64 {
+	if c.encrypted() {
+		return MaxBlockSize - gcmOverhead
+	}
+	return MaxBlockSize
 }
 
 func (c *Config) setDefaults() {
 	if c.BlockSize == 0 {
-		c.BlockSize = DefaultBlockSize
-		if len(c.EncryptionKey) > 0 {
-			c.BlockSize -= gcmOverhead
-		}
+		c.BlockSize = c.maxPlainBlock()
 	}
 	if c.Parallelism <= 0 {
 		c.Parallelism = 4
 	}
-	if c.MinReplicas <= 0 {
-		c.MinReplicas = 1
-	}
 	if c.RPCTimeout <= 0 {
 		c.RPCTimeout = 30 * time.Second
+	}
+	if c.CommitTimeout <= 0 {
+		c.CommitTimeout = 2 * time.Minute
 	}
 	if c.Retries < 0 {
 		c.Retries = 0
@@ -84,16 +92,11 @@ func (c *Config) validate() error {
 	if c.MasterAddr == "" {
 		return errors.New("endereço do mestre não informado")
 	}
-	if len(c.EncryptionKey) > 0 && len(c.EncryptionKey) != 32 {
+	if c.encrypted() && len(c.EncryptionKey) != 32 {
 		return errors.New("a chave de criptografia deve ter exatamente 32 bytes")
 	}
-
-	maxAllowed := int64(MaxBlockSize)
-	if len(c.EncryptionKey) > 0 {
-		maxAllowed -= gcmOverhead
-	}
-	if c.BlockSize < 1 || c.BlockSize > maxAllowed {
-		return fmt.Errorf("block size deve estar entre 1 e %d bytes", maxAllowed)
+	if c.BlockSize < 1 || c.BlockSize > c.maxPlainBlock() {
+		return fmt.Errorf("block size deve estar entre 1 e %d bytes", c.maxPlainBlock())
 	}
 	return nil
 }
@@ -102,7 +105,7 @@ func (c *Config) validate() error {
 // É seguro para uso concorrente.
 type Client struct {
 	cfg    Config
-	master pb.ClientServiceClient
+	master mpb.MasterServiceClient
 
 	masterConn *grpc.ClientConn
 
@@ -125,7 +128,7 @@ func New(cfg Config) (*Client, error) {
 
 	return &Client{
 		cfg:        cfg,
-		master:     pb.NewClientServiceClient(conn),
+		master:     mpb.NewMasterServiceClient(conn),
 		masterConn: conn,
 		nodes:      make(map[string]*grpc.ClientConn),
 	}, nil
@@ -156,12 +159,12 @@ func dial(addr string) (*grpc.ClientConn, error) {
 }
 
 // storage devolve (e reaproveita) a conexão com um nó.
-func (c *Client) storage(addr string) (pb.StorageServiceClient, error) {
+func (c *Client) storage(addr string) (storagepb.StorageServiceClient, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if conn, ok := c.nodes[addr]; ok {
-		return pb.NewStorageServiceClient(conn), nil
+		return storagepb.NewStorageServiceClient(conn), nil
 	}
 
 	conn, err := dial(addr)
@@ -169,99 +172,9 @@ func (c *Client) storage(addr string) (pb.StorageServiceClient, error) {
 		return nil, fmt.Errorf("conectar ao nó %s: %w", addr, err)
 	}
 	c.nodes[addr] = conn
-	return pb.NewStorageServiceClient(conn), nil
+	return storagepb.NewStorageServiceClient(conn), nil
 }
 
 func (c *Client) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, c.cfg.RPCTimeout)
-}
-
-// List devolve os arquivos cujo caminho começa com prefix.
-func (c *Client) List(ctx context.Context, prefix string) ([]*pb.FileInfo, error) {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	resp, err := c.master.ListFiles(ctx, &pb.ListFilesRequest{Prefix: prefix})
-	if err != nil {
-		return nil, fmt.Errorf("listar arquivos: %w", err)
-	}
-	return resp.GetFiles(), nil
-}
-
-// Stat devolve os metadados e a localização dos blocos de um arquivo.
-func (c *Client) Stat(ctx context.Context, path string) (*pb.GetFileResponse, error) {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	resp, err := c.master.GetFile(ctx, &pb.GetFileRequest{Path: path})
-	if err != nil {
-		return nil, fmt.Errorf("consultar %s: %w", path, err)
-	}
-	return resp, nil
-}
-
-// Delete pede ao mestre a remoção do arquivo. A remoção dos blocos nos
-// nós é responsabilidade do mestre.
-func (c *Client) Delete(ctx context.Context, path string) error {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	resp, err := c.master.DeleteFile(ctx, &pb.DeleteFileRequest{Path: path})
-	if err != nil {
-		return fmt.Errorf("remover %s: %w", path, err)
-	}
-	if !resp.GetDeleted() {
-		return fmt.Errorf("remover %s: mestre não confirmou a remoção", path)
-	}
-	return nil
-}
-
-// Move renomeia ou move um arquivo ou diretório. Só altera metadados no
-// mestre: nenhum bloco é copiado.
-func (c *Client) Move(ctx context.Context, from, to string, overwrite bool) (*pb.FileInfo, error) {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	resp, err := c.master.Move(ctx, &pb.MoveRequest{From: from, To: to, Overwrite: overwrite})
-	if err != nil {
-		return nil, fmt.Errorf("mover %s para %s: %w", from, to, err)
-	}
-	return resp.GetFile(), nil
-}
-
-// MakeDir cria um diretório. Com parents, cria também os intermediários.
-func (c *Client) MakeDir(ctx context.Context, path string, parents bool) error {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	if _, err := c.master.MakeDir(ctx, &pb.MakeDirRequest{Path: path, Parents: parents}); err != nil {
-		return fmt.Errorf("criar diretório %s: %w", path, err)
-	}
-	return nil
-}
-
-// RemoveDir remove um diretório. Sem recursive, o diretório precisa estar vazio.
-func (c *Client) RemoveDir(ctx context.Context, path string, recursive bool) error {
-	ctx, cancel := c.rpcContext(ctx)
-	defer cancel()
-
-	resp, err := c.master.RemoveDir(ctx, &pb.RemoveDirRequest{Path: path, Recursive: recursive})
-	if err != nil {
-		return fmt.Errorf("remover diretório %s: %w", path, err)
-	}
-	if !resp.GetDeleted() {
-		return fmt.Errorf("remover diretório %s: mestre não confirmou a remoção", path)
-	}
-	return nil
-}
-
-func (c *Client) ReportCorruption(ctx context.Context, blockID, nodeID string) error {
-    ctx, cancel := c.rpcContext(ctx)
-    defer cancel()
-
-    _, err := c.master.ReportCorruption(ctx, &pb.ReportCorruptionRequest{
-        BlockId: blockID,
-        NodeId:  nodeID,
-    })
-    return err
 }

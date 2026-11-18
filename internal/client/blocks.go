@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	pb "github.com/felipetojal/bibous/proto"
+	mpb "github.com/felipetojal/bibous/proto/masterpb"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,36 +26,36 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// splitFile lê r uma vez, do início ao fim, e devolve a descrição de cada
-// bloco (tamanho e SHA-256) e o SHA-256 do arquivo inteiro. Os bytes não
-// ficam em memória: no envio cada bloco é relido com ReadAt.
-func (c *Client) splitFile(r io.Reader, blockSize int64) ([]*pb.BlockSpec, int64, string, error) {
+// blockSpec é um bloco como o cliente o calculou: o que será gravado nos
+// nós (já cifrado, se houver chave).
+type blockSpec struct {
+	size int64
+	hash string
+}
+
+// splitFile lê r do início ao fim e devolve, para cada bloco, o tamanho e o
+// SHA-256 do conteúdo que irá aos nós, mais o tamanho total e o SHA-256 da
+// concatenação desses blocos (é o que o mestre confere no commit).
+// Os bytes não ficam em memória: no envio cada bloco é relido com ReadAt.
+//
+// Um arquivo vazio vira um único bloco vazio, como o mestre exige.
+func (c *Client) splitFile(r io.Reader) ([]blockSpec, int64, string, error) {
 	var (
-		specs []*pb.BlockSpec
+		specs []blockSpec
 		total int64
 		whole = sha256.New()
-		buf   = make([]byte, blockSize)
+		buf   = make([]byte, c.cfg.BlockSize)
 	)
 
 	for index := uint32(0); ; index++ {
 		n, err := io.ReadFull(r, buf)
-		if n > 0 {
-			chunk := buf[:n]
-
-			if len(c.cfg.EncryptionKey) == 32 {
-				var encErr error
-				chunk, encErr = encryptBlock(c.cfg.EncryptionKey, index, chunk)
-				if encErr != nil {
-					return nil, 0, "", fmt.Errorf("cifrar bloco %d: %w", index, encErr)
-				}
+		if n > 0 || (index == 0 && n == 0 && errors.Is(err, io.EOF)) {
+			chunk, encErr := c.encodeBlock(index, buf[:n])
+			if encErr != nil {
+				return nil, 0, "", encErr
 			}
-
 			whole.Write(chunk)
-			specs = append(specs, &pb.BlockSpec{
-				Index: index,
-				Size:  int64(len(chunk)),
-				Hash:  sha256Hex(chunk),
-			})
+			specs = append(specs, blockSpec{size: int64(len(chunk)), hash: sha256Hex(chunk)})
 			total += int64(len(chunk))
 		}
 
@@ -70,38 +70,50 @@ func (c *Client) splitFile(r io.Reader, blockSize int64) ([]*pb.BlockSpec, int64
 	return specs, total, hex.EncodeToString(whole.Sum(nil)), nil
 }
 
-// validateLocation confere se um BlockLocation vindo do mestre é utilizável.
-func validateLocation(b *pb.BlockLocation) error {
+// encodeBlock cifra o bloco quando há chave; senão devolve-o como está.
+func (c *Client) encodeBlock(index uint32, plain []byte) ([]byte, error) {
+	if !c.cfg.encrypted() {
+		return plain, nil
+	}
+	out, err := encryptBlock(c.cfg.EncryptionKey, index, plain)
+	if err != nil {
+		return nil, fmt.Errorf("cifrar bloco %d: %w", index, err)
+	}
+	return out, nil
+}
+
+// validatePlacement confere se um bloco vindo do mestre é utilizável.
+func validatePlacement(i int, b *mpb.BlockPlacement) error {
 	if b == nil {
-		return errors.New("bloco ausente na resposta do mestre")
+		return fmt.Errorf("bloco %d ausente na resposta do mestre", i)
 	}
 	if !blockIDPattern.MatchString(b.GetBlockId()) {
-		return fmt.Errorf("bloco %d: block_id inválido %q", b.GetIndex(), b.GetBlockId())
+		return fmt.Errorf("bloco %d: block_id inválido %q", i, b.GetBlockId())
 	}
 	if b.GetVersion() < 1 {
-		return fmt.Errorf("bloco %d: versão inválida %d", b.GetIndex(), b.GetVersion())
+		return fmt.Errorf("bloco %d: versão inválida %d", i, b.GetVersion())
 	}
-	if b.GetSize() < 0 || b.GetSize() > MaxBlockSize {
-		return fmt.Errorf("bloco %d: tamanho inválido %d", b.GetIndex(), b.GetSize())
+	if b.GetSize() > MaxBlockSize {
+		return fmt.Errorf("bloco %d: tamanho inválido %d", i, b.GetSize())
 	}
-	if raw, err := hex.DecodeString(b.GetHash()); err != nil || len(raw) != sha256.Size {
-		return fmt.Errorf("bloco %d: hash inválido", b.GetIndex())
+	if raw, err := hex.DecodeString(b.GetSha256()); err != nil || len(raw) != sha256.Size {
+		return fmt.Errorf("bloco %d: hash inválido", i)
 	}
 	if len(b.GetReplicas()) == 0 {
-		return fmt.Errorf("bloco %d: mestre não indicou nenhuma réplica", b.GetIndex())
+		return fmt.Errorf("bloco %d: nenhuma réplica disponível", i)
 	}
 	for _, r := range b.GetReplicas() {
 		if r.GetAddress() == "" || r.GetNodeId() == "" {
-			return fmt.Errorf("bloco %d: réplica sem node_id ou endereço", b.GetIndex())
+			return fmt.Errorf("bloco %d: réplica sem node_id ou endereço (nó desconhecido pelo mestre?)", i)
 		}
 	}
 	return nil
 }
 
 // uniqueReplicas remove réplicas repetidas (mesmo nó ou mesmo endereço).
-func uniqueReplicas(in []*pb.NodeLocation) []*pb.NodeLocation {
+func uniqueReplicas(in []*mpb.NodeEndpoint) []*mpb.NodeEndpoint {
 	seen := make(map[string]bool, len(in)*2)
-	out := make([]*pb.NodeLocation, 0, len(in))
+	out := make([]*mpb.NodeEndpoint, 0, len(in))
 	for _, r := range in {
 		if seen["id:"+r.GetNodeId()] || seen["addr:"+r.GetAddress()] {
 			continue

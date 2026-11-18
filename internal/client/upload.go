@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
+	"path"
 
-	pb "github.com/felipetojal/bibous/proto"
+	storagepb "github.com/felipetojal/bibous/proto"
+	mpb "github.com/felipetojal/bibous/proto/masterpb"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // UploadOptions ajusta um upload específico.
@@ -21,15 +25,50 @@ type UploadOptions struct {
 
 // Upload envia o arquivo local localPath para remotePath.
 //
-//  1. Divide o arquivo em blocos e calcula os hashes.
-//  2. Pede ao mestre (PrepareUpload) o block_id e as réplicas de cada bloco.
-//  3. Envia cada bloco diretamente às réplicas (StorageService.PutBlock).
-//  4. Confirma ao mestre (CommitUpload) quais réplicas guardaram cada bloco.
-func (c *Client) Upload(
-	ctx context.Context,
-	localPath, remotePath string,
-	opts UploadOptions,
-) (*pb.FileInfo, error) {
+//  1. Divide o arquivo em blocos (cifrando, se houver chave) e calcula os hashes.
+//  2. PrepareUpload: o mestre reserva os nós de cada bloco.
+//  3. Envia cada bloco diretamente a todas as réplicas (StorageService.PutBlock).
+//  4. CommitUpload: o mestre relê as réplicas, confere os hashes e publica.
+//
+// Em caso de falha, o upload é abortado no mestre e os blocos já gravados
+// são apagados dos nós (melhor esforço).
+func (c *Client) Upload(ctx context.Context, localPath, remotePath string, opts UploadOptions) (*mpb.FileInfo, error) {
+	if !opts.Overwrite {
+		return c.upload(ctx, localPath, remotePath)
+	}
+
+	// Sobrescrita: grava num caminho temporário no mesmo diretório e só
+	// então troca, para nunca ficar sem nenhuma versão íntegra.
+	if _, err := c.Stat(ctx, remotePath); err != nil {
+		if status.Code(err) == codes.NotFound {
+			return c.upload(ctx, localPath, remotePath)
+		}
+		return nil, err
+	}
+
+	suffix, err := newOperationID()
+	if err != nil {
+		return nil, err
+	}
+	tmp := path.Join(path.Dir(remotePath), "."+path.Base(remotePath)+".bibous-"+suffix[:12])
+	if _, err := c.upload(ctx, localPath, tmp); err != nil {
+		return nil, err
+	}
+	if err := c.Delete(ctx, remotePath); err != nil {
+		_ = c.Delete(ctx, tmp)
+		return nil, fmt.Errorf("substituir %s: %w", remotePath, err)
+	}
+	if err := c.moveFile(ctx, tmp, remotePath); err != nil {
+		return nil, fmt.Errorf("substituir %s (nova versão ficou em %s): %w", remotePath, tmp, err)
+	}
+	st, err := c.Stat(ctx, remotePath)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func (c *Client) upload(ctx context.Context, localPath, remotePath string) (*mpb.FileInfo, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return nil, err
@@ -44,101 +83,79 @@ func (c *Client) Upload(
 		return nil, fmt.Errorf("%s não é um arquivo regular", localPath)
 	}
 
-	specs, size, fileHash, err := c.splitFile(f, c.cfg.BlockSize)
+	specs, size, fileHash, err := c.splitFile(f)
 	if err != nil {
 		return nil, err
 	}
 
-	uploadID, plan, err := c.prepareUpload(ctx, remotePath, size, fileHash, specs, opts)
+	uploadID, plan, err := c.prepareUpload(ctx, remotePath, size, fileHash, specs)
 	if err != nil {
 		return nil, err
 	}
-
-	stored := make([]*pb.StoredBlock, len(plan))
 
 	err = forEach(ctx, len(plan), c.cfg.Parallelism, c.cfg.Progress,
 		func(ctx context.Context, i int) error {
-			block := plan[i]
-			
-			plainSize := block.GetSize()
-			if len(c.cfg.EncryptionKey) == 32 {
-				plainSize -= gcmOverhead
-			}
-
-			data := make([]byte, plainSize)
-			offset := int64(block.GetIndex()) * c.cfg.BlockSize
-			n, err := f.ReadAt(data, offset)
-			if err != nil && !errors.Is(err, io.EOF) {
-				return fmt.Errorf("ler bloco %d: %w", block.GetIndex(), err)
-			}
-			data = data[:n]
-			if len(c.cfg.EncryptionKey) == 32 {
-				data, err = encryptBlock(c.cfg.EncryptionKey, block.GetIndex(), data)
-				if err != nil {
-					return fmt.Errorf("cifrar bloco %d: %w", block.GetIndex(), err)
-				}
-			}
-			if sha256Hex(data) != block.GetHash() {
-				return fmt.Errorf(
-					"bloco %d mudou desde a divisão: o arquivo foi alterado durante o upload",
-					block.GetIndex(),
-				)
-			}
-
-			nodes, err := c.putReplicas(ctx, block, data)
+			data, err := c.readBlock(f, i)
 			if err != nil {
 				return err
 			}
-
-			stored[i] = &pb.StoredBlock{
-				BlockId: block.GetBlockId(),
-				Version: block.GetVersion(),
-				NodeIds: nodes,
+			if sha256Hex(data) != plan[i].GetSha256() {
+				return fmt.Errorf("bloco %d mudou desde a divisão: o arquivo foi alterado durante o upload", i)
 			}
-			return nil
+			return c.putReplicas(ctx, i, plan[i], data)
 		})
-	if err != nil {
-		// Sem commit o mestre não publica o arquivo; os blocos já
-		// gravados ficam órfãos até o mestre descartar o upload.
-		return nil, fmt.Errorf("upload de %s: %w", localPath, err)
+	if err == nil {
+		commitCtx, cancel := context.WithTimeout(ctx, c.cfg.CommitTimeout)
+		var resp *mpb.CommitUploadResponse
+		resp, err = c.master.CommitUpload(commitCtx, &mpb.CommitUploadRequest{UploadId: uploadID})
+		cancel()
+		if err == nil {
+			return resp.GetFile(), nil
+		}
+		err = fmt.Errorf("confirmar upload no mestre: %w", err)
 	}
 
-	commitCtx, cancel := c.rpcContext(ctx)
+	// Falhou: libera a reserva e apaga o que já foi gravado.
+	cleanup, cancel := context.WithTimeout(context.Background(), c.cfg.RPCTimeout)
 	defer cancel()
-
-	resp, err := c.master.CommitUpload(commitCtx, &pb.CommitUploadRequest{
-		UploadId: uploadID,
-		Blocks:   stored,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("confirmar upload no mestre: %w", err)
-	}
-	return resp.GetFile(), nil
+	_, _ = c.master.AbortUpload(cleanup, &mpb.AbortUploadRequest{UploadId: uploadID})
+	c.deleteBlocks(cleanup, plan)
+	return nil, fmt.Errorf("upload de %s: %w", localPath, err)
 }
 
-// prepareUpload pede o plano ao mestre e devolve os blocos validados,
-// na ordem do arquivo (plan[i].Index == i).
-func (c *Client) prepareUpload(
-	ctx context.Context,
-	remotePath string,
-	size int64,
-	fileHash string,
-	specs []*pb.BlockSpec,
-	opts UploadOptions,
-) (string, []*pb.BlockLocation, error) {
+// readBlock relê o bloco i do arquivo local e o cifra, se for o caso.
+func (c *Client) readBlock(f *os.File, i int) ([]byte, error) {
+	plain := make([]byte, c.cfg.BlockSize)
+	n, err := f.ReadAt(plain, int64(i)*c.cfg.BlockSize)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("ler bloco %d: %w", i, err)
+	}
+	return c.encodeBlock(uint32(i), plain[:n])
+}
+
+// prepareUpload pede o plano ao mestre e devolve os blocos validados, na
+// ordem do arquivo.
+func (c *Client) prepareUpload(ctx context.Context, remotePath string, size int64, fileHash string, specs []blockSpec) (string, []*mpb.BlockPlacement, error) {
+	req := &mpb.PrepareUploadRequest{
+		Path:              remotePath,
+		Size:              uint64(size),
+		Sha256:            fileHash,
+		ReplicationFactor: c.cfg.ReplicationFactor,
+	}
+	for _, s := range specs {
+		req.Blocks = append(req.Blocks, &mpb.BlockSpec{Size: uint64(s.size), Sha256: s.hash})
+	}
+
 	reqCtx, cancel := c.rpcContext(ctx)
 	defer cancel()
-
-	resp, err := c.master.PrepareUpload(reqCtx, &pb.PrepareUploadRequest{
-		Path:              remotePath,
-		Size:              size,
-		Hash:              fileHash,
-		BlockSize:         c.cfg.BlockSize,
-		ReplicationFactor: c.cfg.ReplicationFactor,
-		Blocks:            specs,
-		Overwrite:         opts.Overwrite,
-	})
+	resp, err := c.master.PrepareUpload(reqCtx, req)
 	if err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			return "", nil, fmt.Errorf("%s já existe (use put -f para sobrescrever): %w", remotePath, err)
+		}
+		if status.Code(err) == codes.NotFound {
+			return "", nil, fmt.Errorf("diretório %s não existe (crie com mkdir -p): %w", path.Dir(remotePath), err)
+		}
 		return "", nil, fmt.Errorf("preparar upload no mestre: %w", err)
 	}
 
@@ -146,97 +163,62 @@ func (c *Client) prepareUpload(
 		return "", nil, errors.New("mestre não devolveu upload_id")
 	}
 	if len(resp.GetBlocks()) != len(specs) {
-		return "", nil, fmt.Errorf(
-			"mestre devolveu %d blocos, esperado %d",
-			len(resp.GetBlocks()), len(specs),
-		)
+		return "", nil, fmt.Errorf("mestre devolveu %d blocos, esperado %d", len(resp.GetBlocks()), len(specs))
 	}
-
-	// O mestre pode responder fora de ordem: reorganiza pelo index.
-	plan := make([]*pb.BlockLocation, len(specs))
-	for _, b := range resp.GetBlocks() {
-		if err := validateLocation(b); err != nil {
+	for i, b := range resp.GetBlocks() {
+		if err := validatePlacement(i, b); err != nil {
 			return "", nil, err
 		}
-		i := int(b.GetIndex())
-		if i >= len(specs) || plan[i] != nil {
-			return "", nil, fmt.Errorf("mestre devolveu index de bloco inválido: %d", i)
-		}
-		if b.GetSize() != specs[i].GetSize() || b.GetHash() != specs[i].GetHash() {
+		if int64(b.GetSize()) != specs[i].size || b.GetSha256() != specs[i].hash {
 			return "", nil, fmt.Errorf("bloco %d: tamanho/hash diferentes do enviado", i)
 		}
-		b.Replicas = uniqueReplicas(b.GetReplicas())
-		if len(b.GetReplicas()) < c.cfg.MinReplicas {
-			return "", nil, fmt.Errorf(
-				"bloco %d: mestre indicou %d réplica(s), mínimo exigido %d",
-				i, len(b.GetReplicas()), c.cfg.MinReplicas,
-			)
-		}
-		plan[i] = b
 	}
-
-	return resp.GetUploadId(), plan, nil
+	return resp.GetUploadId(), resp.GetBlocks(), nil
 }
 
-// putReplicas envia o bloco a todas as réplicas em paralelo e devolve os
-// node_ids que confirmaram. Falha se menos de MinReplicas confirmarem.
-func (c *Client) putReplicas(ctx context.Context, block *pb.BlockLocation, data []byte) ([]string, error) {
-	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		acked []string
-		errs  []error
-	)
-
-	for _, replica := range block.GetReplicas() {
-		wg.Add(1)
-		go func(replica *pb.NodeLocation) {
-			defer wg.Done()
-
-			err := c.putBlock(ctx, replica, block, data)
-
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				errs = append(errs, fmt.Errorf("nó %s (%s): %w", replica.GetNodeId(), replica.GetAddress(), err))
-				return
+// putReplicas envia o bloco a todas as réplicas em paralelo. O mestre só
+// aceita o commit se todas tiverem o bloco, então qualquer falha é fatal.
+func (c *Client) putReplicas(ctx context.Context, i int, block *mpb.BlockPlacement, data []byte) error {
+	replicas := uniqueReplicas(block.GetReplicas())
+	errs := make([]error, len(replicas))
+	done := make(chan struct{})
+	for k, replica := range replicas {
+		go func(k int, replica *mpb.NodeEndpoint) {
+			defer func() { done <- struct{}{} }()
+			if err := c.putBlock(ctx, replica, block, data); err != nil {
+				errs[k] = fmt.Errorf("nó %s (%s): %w", replica.GetNodeId(), replica.GetAddress(), err)
 			}
-			acked = append(acked, replica.GetNodeId())
-		}(replica)
+		}(k, replica)
 	}
-	wg.Wait()
-
-	if len(acked) < c.cfg.MinReplicas {
-		return nil, fmt.Errorf(
-			"bloco %d: %d de %d réplicas confirmaram (mínimo %d): %w",
-			block.GetIndex(), len(acked), len(block.GetReplicas()), c.cfg.MinReplicas,
-			errors.Join(errs...),
-		)
+	for range replicas {
+		<-done
 	}
-	return acked, nil
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("bloco %d: %w", i, err)
+	}
+	return nil
 }
 
-func (c *Client) putBlock(ctx context.Context, replica *pb.NodeLocation, block *pb.BlockLocation, data []byte) error {
+func (c *Client) putBlock(ctx context.Context, replica *mpb.NodeEndpoint, block *mpb.BlockPlacement, data []byte) error {
 	node, err := c.storage(replica.GetAddress())
 	if err != nil {
 		return err
 	}
-
 	operationID, err := newOperationID()
 	if err != nil {
 		return err
 	}
 
-	req := &pb.PutRequest{
+	req := &storagepb.PutRequest{
 		OperationId: operationID,
 		BlockId:     block.GetBlockId(),
 		Version:     block.GetVersion(),
 		Size:        int64(len(data)),
-		Hash:        block.GetHash(),
+		Hash:        block.GetSha256(),
 		Data:        data,
 	}
 
-	var ack *pb.PutResponse
+	var ack *storagepb.PutResponse
 	err = c.withRetry(ctx, func(ctx context.Context) error {
 		var err error
 		ack, err = node.PutBlock(ctx, req)
@@ -250,13 +232,39 @@ func (c *Client) putBlock(ctx context.Context, replica *pb.NodeLocation, block *
 	if ack.GetNodeId() != replica.GetNodeId() {
 		return fmt.Errorf("respondeu como nó %q, esperado %q", ack.GetNodeId(), replica.GetNodeId())
 	}
-	if ack.GetBlockId() != req.GetBlockId() ||
-		ack.GetVersion() != req.GetVersion() ||
-		ack.GetSize() != req.GetSize() ||
-		ack.GetHash() != req.GetHash() {
+	if ack.GetBlockId() != req.GetBlockId() || ack.GetVersion() != req.GetVersion() ||
+		ack.GetSize() != req.GetSize() || ack.GetHash() != req.GetHash() {
 		return errors.New("confirmação (ACK) não corresponde ao bloco enviado")
 	}
 	return nil
+}
+
+// deleteBlocks apaga os blocos de todas as réplicas, ignorando erros
+// (o bloco pode nem ter chegado a ser gravado).
+func (c *Client) deleteBlocks(ctx context.Context, blocks []*mpb.BlockPlacement) int {
+	deleted := 0
+	for _, b := range blocks {
+		for _, r := range b.GetReplicas() {
+			if r.GetAddress() == "" {
+				continue
+			}
+			node, err := c.storage(r.GetAddress())
+			if err != nil {
+				continue
+			}
+			op, err := newOperationID()
+			if err != nil {
+				continue
+			}
+			callCtx, cancel := c.rpcContext(ctx)
+			_, err = node.DeleteBlock(callCtx, &storagepb.DeleteRequest{OperationId: op, BlockId: b.GetBlockId(), Version: b.GetVersion()})
+			cancel()
+			if err == nil {
+				deleted++
+			}
+		}
+	}
+	return deleted
 }
 
 func newOperationID() (string, error) {

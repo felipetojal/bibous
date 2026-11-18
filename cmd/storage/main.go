@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -89,6 +90,21 @@ func main() {
 			server.Stop()
 		}
 	}()
+
+	// Registro automático no mestre e heartbeats periódicos.
+	if cfg.MasterAddr != "" {
+		linkCtx, stopLink := context.WithCancel(context.Background())
+		defer stopLink()
+		link := &storage.MasterLink{
+			MasterAddr: cfg.MasterAddr, NodeID: cfg.NodeId, AdvertiseAddr: cfg.AdvertiseAddr,
+			MachineID: cfg.MachineId, DiskID: cfg.DiskId, DataDir: store.DataDir,
+			CapacityLimit: cfg.Capacity,
+			Interval:      cfg.HeartbeatInterval,
+		}
+		go link.Run(linkCtx)
+	} else {
+		log.Print("MASTER_ADDR não definido: o nó não se registra no mestre")
+	}
 
 	log.Printf(
 		"storage iniciado node=%s address=%s data_dir=%s",

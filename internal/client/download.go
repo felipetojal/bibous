@@ -10,24 +10,42 @@ import (
 	"os"
 	"path/filepath"
 
-	pb "github.com/felipetojal/bibous/proto"
+	storagepb "github.com/felipetojal/bibous/proto"
+	mpb "github.com/felipetojal/bibous/proto/masterpb"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Download baixa remotePath para o arquivo local localPath.
 //
 // Cada bloco é lido de uma das réplicas indicadas pelo mestre; se uma
-// réplica falhar ou devolver dados com hash errado, tenta a próxima.
-// O arquivo é montado num temporário e só substitui localPath depois que
-// o hash do arquivo inteiro confere.
-func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*pb.FileInfo, error) {
-	meta, err := c.Stat(ctx, remotePath)
+// réplica falhar ou devolver dados com hash errado, a corrupção é
+// reportada ao mestre e o cliente tenta a próxima réplica. O arquivo é
+// montado num temporário e só substitui localPath no final.
+func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*mpb.FileInfo, error) {
+	file, err := c.Stat(ctx, remotePath)
 	if err != nil {
 		return nil, err
 	}
-
-	blocks, offsets, err := validateFileLayout(meta)
-	if err != nil {
+	blocks := file.GetBlocks()
+	if err := validateFileLayout(file); err != nil {
 		return nil, fmt.Errorf("metadados de %s: %w", remotePath, err)
+	}
+
+	// Posição de cada bloco no arquivo final (texto claro).
+	offsets := make([]int64, len(blocks))
+	var plainTotal int64
+	for i, b := range blocks {
+		offsets[i] = plainTotal
+		size := int64(b.GetSize())
+		if c.cfg.encrypted() {
+			if size < gcmOverhead {
+				return nil, fmt.Errorf("bloco %d menor que a sobrecarga da cifra: o arquivo foi enviado sem -key?", i)
+			}
+			size -= gcmOverhead
+		}
+		plainTotal += size
 	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(localPath), ".bibous-download-*")
@@ -42,29 +60,27 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 			os.Remove(tmpPath)
 		}
 	}()
-
-	if len(c.cfg.EncryptionKey) == 0 {
-		if err := tmp.Truncate(meta.GetFile().GetSize()); err != nil {
-			return nil, err
-		}
+	if err := tmp.Truncate(plainTotal); err != nil {
+		return nil, err
 	}
+
+	// Hash do que veio dos nós, bloco a bloco, para conferir o hash do
+	// arquivo registrado no mestre (calculado sobre o conteúdo gravado).
+	stored := make([]string, len(blocks))
 
 	err = forEach(ctx, len(blocks), c.cfg.Parallelism, c.cfg.Progress,
 		func(ctx context.Context, i int) error {
-			data, err := c.getFromAnyReplica(ctx, blocks[i])
+			data, err := c.getFromAnyReplica(ctx, i, blocks[i])
 			if err != nil {
 				return err
 			}
-			writeOffset := offsets[i]
-			if len(c.cfg.EncryptionKey) == 32 {
-				data, err = decryptBlock(c.cfg.EncryptionKey, blocks[i].GetIndex(), data)
-				if err != nil {
-					return fmt.Errorf("decifrar bloco %d: %w", i, err)
+			stored[i] = sha256Hex(data)
+			if c.cfg.encrypted() {
+				if data, err = decryptBlock(c.cfg.EncryptionKey, uint32(i), data); err != nil {
+					return fmt.Errorf("bloco %d: %w", i, err)
 				}
-				writeOffset -= int64(i) * gcmOverhead
 			}
-
-			if _, err := tmp.WriteAt(data, writeOffset); err != nil {
+			if _, err := tmp.WriteAt(data, offsets[i]); err != nil {
 				return fmt.Errorf("gravar bloco %d: %w", i, err)
 			}
 			return nil
@@ -73,7 +89,8 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 		return nil, fmt.Errorf("download de %s: %w", remotePath, err)
 	}
 
-	if want := meta.GetFile().GetHash(); want != "" && len(c.cfg.EncryptionKey) == 0 {
+	if !c.cfg.encrypted() {
+		// Sem cifra, o conteúdo gravado é o próprio arquivo.
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -81,12 +98,11 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 		if _, err := io.Copy(h, tmp); err != nil {
 			return nil, err
 		}
-		if got := hex.EncodeToString(h.Sum(nil)); got != want {
-			return nil, fmt.Errorf("hash do arquivo montado (%s) difere do registrado no mestre (%s)", got, want)
+		if got := hex.EncodeToString(h.Sum(nil)); got != file.GetSha256() {
+			return nil, fmt.Errorf("hash do arquivo montado (%s) difere do registrado no mestre (%s)", got, file.GetSha256())
 		}
 	}
 
-	// CreateTemp cria com 0600; usa a permissão comum de arquivo.
 	if err := tmp.Chmod(0o644); err != nil {
 		return nil, err
 	}
@@ -100,50 +116,29 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 		return nil, err
 	}
 	published = true
-
-	return meta.GetFile(), nil
+	return file, nil
 }
 
-// validateFileLayout confere se os blocos formam o arquivo inteiro, sem
-// buracos nem sobreposição, e devolve o deslocamento de cada um.
-func validateFileLayout(meta *pb.GetFileResponse) ([]*pb.BlockLocation, []int64, error) {
-	if meta.GetFile() == nil {
-		return nil, nil, errors.New("mestre não devolveu FileInfo")
-	}
-
-	blocks := make([]*pb.BlockLocation, len(meta.GetBlocks()))
-	for _, b := range meta.GetBlocks() {
-		if err := validateLocation(b); err != nil {
-			return nil, nil, err
+// validateFileLayout confere se os blocos formam o arquivo inteiro.
+func validateFileLayout(f *mpb.FileInfo) error {
+	var total uint64
+	for i, b := range f.GetBlocks() {
+		if err := validatePlacement(i, b); err != nil {
+			return err
 		}
-		i := int(b.GetIndex())
-		if i >= len(blocks) || blocks[i] != nil {
-			return nil, nil, fmt.Errorf("index de bloco inválido ou repetido: %d", i)
-		}
-		blocks[i] = b
-	}
-
-	offsets := make([]int64, len(blocks))
-	var total int64
-	for i, b := range blocks {
-		offsets[i] = total
 		total += b.GetSize()
 	}
-
-	if total != meta.GetFile().GetSize() {
-		return nil, nil, fmt.Errorf(
-			"soma dos blocos (%d bytes) difere do tamanho do arquivo (%d bytes)",
-			total, meta.GetFile().GetSize(),
-		)
+	if total != f.GetSize() {
+		return fmt.Errorf("soma dos blocos (%d bytes) difere do tamanho do arquivo (%d bytes)", total, f.GetSize())
 	}
-	return blocks, offsets, nil
+	return nil
 }
 
 // getFromAnyReplica tenta as réplicas em sequência. A réplica inicial
-// varia com o index do bloco para espalhar a leitura entre os nós.
-func (c *Client) getFromAnyReplica(ctx context.Context, block *pb.BlockLocation) ([]byte, error) {
+// varia com o índice do bloco para espalhar a leitura entre os nós.
+func (c *Client) getFromAnyReplica(ctx context.Context, i int, block *mpb.BlockPlacement) ([]byte, error) {
 	replicas := uniqueReplicas(block.GetReplicas())
-	start := int(block.GetIndex()) % len(replicas)
+	start := i % len(replicas)
 
 	var errs []error
 	for k := range replicas {
@@ -158,44 +153,47 @@ func (c *Client) getFromAnyReplica(ctx context.Context, block *pb.BlockLocation)
 		}
 		errs = append(errs, fmt.Errorf("nó %s (%s): %w", replica.GetNodeId(), replica.GetAddress(), err))
 	}
-
-	return nil, fmt.Errorf(
-		"bloco %d (%s): nenhuma réplica disponível: %w",
-		block.GetIndex(), block.GetBlockId(), errors.Join(errs...),
-	)
+	return nil, fmt.Errorf("bloco %d (%s): nenhuma réplica disponível: %w", i, block.GetBlockId(), errors.Join(errs...))
 }
 
-func (c *Client) getBlock(ctx context.Context, replica *pb.NodeLocation, block *pb.BlockLocation) ([]byte, error) {
+// errCorrupt marca um bloco que chegou, mas com conteúdo errado.
+var errCorrupt = errors.New("hash do bloco não confere com o registrado no mestre")
+
+func (c *Client) getBlock(ctx context.Context, replica *mpb.NodeEndpoint, block *mpb.BlockPlacement) ([]byte, error) {
 	node, err := c.storage(replica.GetAddress())
 	if err != nil {
 		return nil, err
 	}
 
-	var resp *pb.GetResponse
+	var resp *storagepb.GetResponse
 	err = c.withRetry(ctx, func(ctx context.Context) error {
 		var err error
-		resp, err = node.GetBlock(ctx, &pb.GetRequest{
-			BlockId: block.GetBlockId(),
-			Version: block.GetVersion(),
-		})
+		resp, err = node.GetBlock(ctx, &storagepb.GetRequest{BlockId: block.GetBlockId(), Version: block.GetVersion()})
 		return err
 	})
 	if err != nil {
+		// O próprio nó detectou que a cópia local está corrompida.
+		if status.Code(err) == codes.DataLoss {
+			c.reportCorruption(ctx, replica.GetNodeId(), block)
+		}
 		return nil, err
 	}
 
-	data := resp.GetData()
-
 	// O hash de referência é o do mestre, não o que o nó informa.
-	if resp.GetBlockId() != block.GetBlockId() || resp.GetVersion() != block.GetVersion() {
-		return nil, errors.New("nó devolveu outro bloco")
-	}
-	if int64(len(data)) != block.GetSize() {
-		return nil, fmt.Errorf("tamanho %d, esperado %d", len(data), block.GetSize())
-	}
-	if sha256Hex(data) != block.GetHash() {
-		_ = c.ReportCorruption(ctx, block.GetBlockId(), replica.GetNodeId())
-		return nil, errors.New("hash do bloco não confere com o registrado no mestre")
+	data := resp.GetData()
+	if resp.GetBlockId() != block.GetBlockId() || resp.GetVersion() != block.GetVersion() ||
+		uint64(len(data)) != block.GetSize() || sha256Hex(data) != block.GetSha256() {
+		c.reportCorruption(ctx, replica.GetNodeId(), block)
+		return nil, errCorrupt
 	}
 	return data, nil
+}
+
+// reportCorruption avisa o mestre para descartar a réplica e recriá-la.
+func (c *Client) reportCorruption(ctx context.Context, nodeID string, block *mpb.BlockPlacement) {
+	callCtx, cancel := c.rpcContext(ctx)
+	defer cancel()
+	_, _ = c.master.ReportCorruption(callCtx, &mpb.CorruptionReport{
+		NodeId: nodeID, BlockId: block.GetBlockId(), Version: block.GetVersion(),
+	})
 }
