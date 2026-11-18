@@ -37,6 +37,7 @@ service ClientService {
   rpc MakeDir(MakeDirRequest) returns (MakeDirResponse);
   // Remove um diretório; falha se não estiver vazio, salvo recursive=true.
   rpc RemoveDir(RemoveDirRequest) returns (RemoveDirResponse);
+  rpc ReportCorruption(ReportCorruptionRequest) returns (ReportCorruptionResponse);
 }
 
 // Estado de replicação/integridade de um arquivo (RF1).
@@ -167,3 +168,10 @@ message RemoveDirRequest {
 message RemoveDirResponse {
   bool deleted = 1;
 }
+
+message ReportCorruptionRequest {
+  string block_id = 1;
+  string node_id = 2; // O nó que entregou o dado com hash incorreto
+}
+
+message ReportCorruptionResponse {}
