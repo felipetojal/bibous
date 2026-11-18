@@ -29,7 +29,7 @@ func sha256Hex(data []byte) string {
 // splitFile lê r uma vez, do início ao fim, e devolve a descrição de cada
 // bloco (tamanho e SHA-256) e o SHA-256 do arquivo inteiro. Os bytes não
 // ficam em memória: no envio cada bloco é relido com ReadAt.
-func splitFile(r io.Reader, blockSize int64) ([]*pb.BlockSpec, int64, string, error) {
+func (c *Client) splitFile(r io.Reader, blockSize int64) ([]*pb.BlockSpec, int64, string, error) {
 	var (
 		specs []*pb.BlockSpec
 		total int64
@@ -41,13 +41,22 @@ func splitFile(r io.Reader, blockSize int64) ([]*pb.BlockSpec, int64, string, er
 		n, err := io.ReadFull(r, buf)
 		if n > 0 {
 			chunk := buf[:n]
+
+			if len(c.cfg.EncryptionKey) == 32 {
+				var encErr error
+				chunk, encErr = encryptBlock(c.cfg.EncryptionKey, index, chunk)
+				if encErr != nil {
+					return nil, 0, "", fmt.Errorf("cifrar bloco %d: %w", index, encErr)
+				}
+			}
+
 			whole.Write(chunk)
 			specs = append(specs, &pb.BlockSpec{
 				Index: index,
-				Size:  int64(n),
+				Size:  int64(len(chunk)),
 				Hash:  sha256Hex(chunk),
 			})
-			total += int64(n)
+			total += int64(len(chunk))
 		}
 
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
