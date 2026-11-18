@@ -55,7 +55,6 @@ func main() {
 		os.Exit(1)
 	}
 }
-
 func run() error {
 	defaultMaster := os.Getenv("BIBOUS_MASTER")
 	if defaultMaster == "" {

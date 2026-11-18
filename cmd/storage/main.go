@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	pb "github.com/felipetojal/bibous/proto"
 	"github.com/felipetojal/bibous/internal/storage"
+	pb "github.com/felipetojal/bibous/proto"
 	"github.com/joho/godotenv"
 
 	"google.golang.org/grpc"
@@ -33,6 +33,26 @@ func main() {
 		log.Fatalf("inicializar armazenamento: %v", err)
 	}
 
+	defer store.Close()
+
+	stopScrub := make(chan struct{})
+	defer close(stopScrub)
+	if cfg.ScrubInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.ScrubInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopScrub:
+					return
+				case <-ticker.C:
+					result, err := store.Scrub()
+					log.Printf("scrub periódico node=%s checked=%d corrupt=%d error=%v", cfg.NodeId, result.Checked, result.Corrupt, err)
+				}
+			}
+		}()
+	}
+
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		log.Fatalf("escutar em %s: %v", cfg.Listen, err)
@@ -45,7 +65,7 @@ func main() {
 
 	pb.RegisterStorageServiceServer(
 		server,
-		storage.NewRPCServer(store, cfg.NodeId),
+		storage.NewRPCServer(store, cfg.NodeId, cfg.Peers),
 	)
 
 	signals := make(chan os.Signal, 1)

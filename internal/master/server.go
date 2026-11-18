@@ -4,53 +4,40 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
 
-	grpc "google.golang.org/grpc"
+	pb "github.com/felipetojal/bibous/proto/masterpb"
+	"google.golang.org/grpc"
 )
 
-// RPCServer encapsula os dados para um servidor
-// RPC.
+// RPCServer administra apenas o transporte gRPC, não os dados do domínio.
 type RPCServer struct {
 	listenAddr string
 	listenPort string
 	grpc       *grpc.Server
 }
 
-var (
-	ErrorCreatingListener = errors.New("unable to create listener for RPCServer")
-	ErrorServingRequests  = errors.New("unable to server requests with listener.")
-)
-
-// NewRPCServer é o construtor de RPCServer.
-func NewRPCServer(listenAddr, listenPort string) *RPCServer {
-	grpc := grpc.NewServer()
-	return &RPCServer{
-		listenAddr: listenAddr,
-		listenPort: listenPort,
-		grpc:       grpc,
-	}
+// NewRPCServer registra o contrato do mestre na instância gRPC.
+func NewRPCServer(listenAddr, listenPort string, service pb.MasterServiceServer) *RPCServer {
+	server := grpc.NewServer()
+	pb.RegisterMasterServiceServer(server, service)
+	return &RPCServer{listenAddr: listenAddr, listenPort: listenPort, grpc: server}
 }
 
-// Start inicializa o servidor RPC.
-func (rpc *RPCServer) Start() error {
-	address := net.JoinHostPort(rpc.listenAddr, rpc.listenPort)
-
-	listener, err := net.Listen("tcp", address)
+// Start abre a porta TCP e bloqueia enquanto atende os RPCs.
+func (r *RPCServer) Start() error {
+	addr := net.JoinHostPort(r.listenAddr, r.listenPort)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("%v | %w: %w", time.Now(), ErrorCreatingListener, err)
+		return fmt.Errorf("master listen %s: %w", addr, err)
 	}
-
-	fmt.Printf("%v | Master listening on address %s:%s", time.Now(), rpc.listenAddr, rpc.listenPort)
-
-	if err := rpc.grpc.Serve(listener); err != nil {
-		return fmt.Errorf("%v | %w: %w", time.Now(), ErrorServingRequests, err)
+	if err = r.grpc.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		return fmt.Errorf("master serve: %w", err)
 	}
-
 	return nil
 }
 
-// Stop é responsável por desligar o servidor.
-func (rpc *RPCServer) Stop() {
-	rpc.grpc.GracefulStop()
-}
+// Stop inicia encerramento gracioso, aguardando chamadas em curso.
+func (r *RPCServer) Stop() { r.grpc.GracefulStop() }
+
+// ForceStop interrompe imediatamente as conexões gRPC.
+func (r *RPCServer) ForceStop() { r.grpc.Stop() }
