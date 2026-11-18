@@ -43,8 +43,10 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 		}
 	}()
 
-	if err := tmp.Truncate(meta.GetFile().GetSize()); err != nil {
-		return nil, err
+	if len(c.cfg.EncryptionKey) == 0 {
+		if err := tmp.Truncate(meta.GetFile().GetSize()); err != nil {
+			return nil, err
+		}
 	}
 
 	err = forEach(ctx, len(blocks), c.cfg.Parallelism, c.cfg.Progress,
@@ -53,7 +55,16 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 			if err != nil {
 				return err
 			}
-			if _, err := tmp.WriteAt(data, offsets[i]); err != nil {
+			writeOffset := offsets[i]
+			if len(c.cfg.EncryptionKey) == 32 {
+				data, err = decryptBlock(c.cfg.EncryptionKey, blocks[i].GetIndex(), data)
+				if err != nil {
+					return fmt.Errorf("decifrar bloco %d: %w", i, err)
+				}
+				writeOffset -= int64(i) * gcmOverhead
+			}
+
+			if _, err := tmp.WriteAt(data, writeOffset); err != nil {
 				return fmt.Errorf("gravar bloco %d: %w", i, err)
 			}
 			return nil
@@ -62,7 +73,7 @@ func (c *Client) Download(ctx context.Context, remotePath, localPath string) (*p
 		return nil, fmt.Errorf("download de %s: %w", remotePath, err)
 	}
 
-	if want := meta.GetFile().GetHash(); want != "" {
+	if want := meta.GetFile().GetHash(); want != "" && len(c.cfg.EncryptionKey) == 0 {
 		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -183,6 +194,7 @@ func (c *Client) getBlock(ctx context.Context, replica *pb.NodeLocation, block *
 		return nil, fmt.Errorf("tamanho %d, esperado %d", len(data), block.GetSize())
 	}
 	if sha256Hex(data) != block.GetHash() {
+		_ = c.ReportCorruption(ctx, block.GetBlockId(), replica.GetNodeId())
 		return nil, errors.New("hash do bloco não confere com o registrado no mestre")
 	}
 	return data, nil
