@@ -54,11 +54,17 @@ type Config struct {
 
 	// Progress, se não for nil, é chamado a cada bloco concluído.
 	Progress func(done, total int)
+
+	// Chave AES-256 (32 bytes). Se vazia, criptografia desligada.
+	EncryptionKey []byte
 }
 
 func (c *Config) setDefaults() {
 	if c.BlockSize == 0 {
 		c.BlockSize = DefaultBlockSize
+		if len(c.EncryptionKey) > 0 {
+			c.BlockSize -= gcmOverhead
+		}
 	}
 	if c.Parallelism <= 0 {
 		c.Parallelism = 4
@@ -78,8 +84,16 @@ func (c *Config) validate() error {
 	if c.MasterAddr == "" {
 		return errors.New("endereço do mestre não informado")
 	}
-	if c.BlockSize < 1 || c.BlockSize > MaxBlockSize {
-		return fmt.Errorf("block size deve estar entre 1 e %d bytes", MaxBlockSize)
+	if len(c.EncryptionKey) > 0 && len(c.EncryptionKey) != 32 {
+		return errors.New("a chave de criptografia deve ter exatamente 32 bytes")
+	}
+
+	maxAllowed := int64(MaxBlockSize)
+	if len(c.EncryptionKey) > 0 {
+		maxAllowed -= gcmOverhead
+	}
+	if c.BlockSize < 1 || c.BlockSize > maxAllowed {
+		return fmt.Errorf("block size deve estar entre 1 e %d bytes", maxAllowed)
 	}
 	return nil
 }
@@ -239,4 +253,15 @@ func (c *Client) RemoveDir(ctx context.Context, path string, recursive bool) err
 		return fmt.Errorf("remover diretório %s: mestre não confirmou a remoção", path)
 	}
 	return nil
+}
+
+func (c *Client) ReportCorruption(ctx context.Context, blockID, nodeID string) error {
+    ctx, cancel := c.rpcContext(ctx)
+    defer cancel()
+
+    _, err := c.master.ReportCorruption(ctx, &pb.ReportCorruptionRequest{
+        BlockId: blockID,
+        NodeId:  nodeID,
+    })
+    return err
 }
