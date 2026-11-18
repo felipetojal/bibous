@@ -1,355 +1,267 @@
+// Package client implementa o lado cliente do Bibous: divide arquivos em
+// blocos, consulta o mestre para saber onde gravar/ler cada bloco e
+// transfere os bytes diretamente com os nós de armazenamento.
 package client
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"log"
-	"os"
-	"path/filepath"
+	"sync"
 	"time"
 
-	"github.com/felipetojal/bibous/internal/storage"
 	pb "github.com/felipetojal/bibous/proto"
+
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
-type Client struct{ Timeout time.Duration }
+const (
+	// MaxBlockSize é o maior bloco aceito pelo StorageService.PutBlock.
+	MaxBlockSize = 4 * 1024 * 1024
+	// DefaultBlockSize é usado quando Config.BlockSize é zero.
+	DefaultBlockSize = MaxBlockSize
 
-func (c Client) timeout() time.Duration {
-	if c.Timeout > 0 {
-		return c.Timeout
-	}
-	return 10 * time.Second
-}
-func (c Client) connect(ctx context.Context, r Replica) (*grpc.ClientConn, pb.StorageServiceClient, error) {
-	conn, err := grpc.NewClient(r.Address, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(storage.MaxRPCMessageBytes), grpc.MaxCallSendMsgSize(storage.MaxRPCMessageBytes)))
-	if err != nil {
-		return nil, nil, err
-	}
-	api := pb.NewStorageServiceClient(conn)
-	health, err := api.Heartbeat(ctx, &pb.HeartbeatRequest{Nonce: 42})
-	if err == nil && (health.NodeId != r.NodeID || health.Nonce != 42) {
-		err = fmt.Errorf("identidade diferente em %s", r.Address)
-	}
-	if err != nil {
-		conn.Close()
-		return nil, nil, err
-	}
-	return conn, api, nil
-}
+	// Folga para os metadados da mensagem gRPC além dos dados do bloco.
+	maxMessageBytes = MaxBlockSize + 64*1024
+)
 
-// Uma mesma operação conserva seu ID durante as repetições.
-func (c Client) put(ctx context.Context, r Replica, request *pb.PutRequest) error {
-	var last error
-	for attempt := 0; attempt < 3; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		call, cancel := context.WithTimeout(ctx, c.timeout())
-		conn, api, err := c.connect(call, r)
-		if err == nil {
-			ack, e := api.PutBlock(call, request)
-			err = e
-			if err == nil && (ack.NodeId != r.NodeID || ack.BlockId != request.BlockId || ack.Version != request.Version || ack.Size != request.Size || ack.Hash != request.Hash) {
-				err = fmt.Errorf("ACK inválido de %s", r.NodeID)
-			}
-			conn.Close()
-		}
-		cancel()
-		if err == nil {
-			return nil
-		}
-		last = err
-		code := status.Code(err)
-		if code != codes.Unavailable && code != codes.DeadlineExceeded {
-			break
-		}
-	}
-	return fmt.Errorf("réplica %s: %w", r.NodeID, last)
-}
-func (c Client) Upload(ctx context.Context, input, manifestPath string, nodes []Replica) error {
-	if err := validateNodes(nodes); err != nil {
-		return err
-	}
-	lock, err := lockManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	f, err := os.Open(input)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	before, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !before.Mode().IsRegular() {
-		return fmt.Errorf("entrada precisa ser arquivo regular")
-	}
-	for _, r := range nodes {
-		call, cancel := context.WithTimeout(ctx, c.timeout())
-		conn, _, e := c.connect(call, r)
-		cancel()
-		if e != nil {
-			return e
-		}
-		conn.Close()
-	}
-	fileID, err := NewID()
-	if err != nil {
-		return err
-	}
-	m := &Manifest{FormatVersion: 2, State: "uploading", FileID: fileID, FileName: filepath.Base(input), ChunkSize: storage.MaxBlockBytes, Blocks: []ManifestBlock{}}
-	if err = saveManifest(manifestPath, m, true); err != nil {
-		return err
-	}
-	fullHash := sha256.New()
-	buffer := make([]byte, storage.MaxBlockBytes)
-	for index := 0; ; index++ {
-		if err = ctx.Err(); err != nil {
-			return err
-		}
-		n, readErr := io.ReadFull(f, buffer)
-		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-			return readErr
-		}
-		if n == 0 {
-			break
-		}
-		data := buffer[:n]
-		b := ManifestBlock{Index: index, BlockID: fmt.Sprintf("%s-%d", fileID, index), Version: 1, Size: int64(n), Hash: hashBytes(data), Replicas: append([]Replica(nil), nodes...)}
-		for i := range b.Replicas {
-			b.Replicas[i].Confirmed = false
-		}
-		m.Blocks = append(m.Blocks, b)
-		m.Size += int64(n)
-		// Registra TODOS os destinos antes de enviar, inclusive para limpar um Put
-		// que teve sucesso no servidor mas perdeu a resposta na rede.
-		if err = saveManifest(manifestPath, m, false); err != nil {
-			return err
-		}
-		op, err := NewID()
-		if err != nil {
-			return err
-		}
-		request := &pb.PutRequest{OperationId: op, BlockId: b.BlockID, Version: b.Version, Size: b.Size, Hash: b.Hash, Data: data}
-		for i, r := range b.Replicas {
-			if err = c.put(ctx, r, request); err != nil {
-				return fmt.Errorf("upload incompleto; manifesto preservado para delete: %w", err)
-			}
-			m.Blocks[index].Replicas[i].Confirmed = true
-			if err = saveManifest(manifestPath, m, false); err != nil {
-				return err
-			}
-		}
-		_, _ = fullHash.Write(data)
-		if readErr == io.ErrUnexpectedEOF {
-			break
-		}
-	}
-	after, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if before.Size() != after.Size() || before.Size() != m.Size || !before.ModTime().Equal(after.ModTime()) {
-		return fmt.Errorf("entrada alterada durante upload; manifesto incompleto preservado")
-	}
-	m.Hash = hex.EncodeToString(fullHash.Sum(nil))
-	m.State = "complete"
-	return saveManifest(manifestPath, m, false)
-}
-func (c Client) fetch(ctx context.Context, b ManifestBlock) ([]byte, error) {
-	var failures []error
-	for _, r := range b.Replicas {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		call, cancel := context.WithTimeout(ctx, c.timeout())
-		conn, api, err := c.connect(call, r)
-		var data []byte
-		if err == nil {
-			response, e := api.GetBlock(call, &pb.GetRequest{BlockId: b.BlockID, Version: b.Version})
-			err = e
-			if err == nil {
-				if response.BlockId != b.BlockID || response.Version != b.Version || response.Size != b.Size || int64(len(response.Data)) != b.Size || response.Hash != b.Hash || hashBytes(response.Data) != b.Hash {
-					err = fmt.Errorf("conteúdo ou metadados inválidos")
-				} else {
-					data = response.Data
-				}
-			}
-			conn.Close()
-		}
-		cancel()
-		if err == nil {
-			return data, nil
-		}
-		log.Printf("tentando próxima réplica: block=%s node=%s erro=%v", b.BlockID, r.NodeID, err)
-		failures = append(failures, fmt.Errorf("%s: %w", r.NodeID, err))
-	}
-	return nil, fmt.Errorf("nenhuma réplica válida para %s: %w", b.BlockID, errors.Join(failures...))
-}
-func (c Client) Download(ctx context.Context, manifestPath, output string) error {
-	m, err := LoadManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	if m.State != "complete" {
-		return fmt.Errorf("manifesto não está complete")
-	}
-	return atomicWrite(output, true, func(w io.Writer) error {
-		fullHash := sha256.New()
-		var total int64
-		for _, b := range m.Blocks {
-			data, err := c.fetch(ctx, b)
-			if err != nil {
-				return err
-			}
-			n, err := w.Write(data)
-			if err != nil {
-				return err
-			}
-			if n != len(data) {
-				return io.ErrShortWrite
-			}
-			_, _ = fullHash.Write(data)
-			total += int64(n)
-		}
-		if total != m.Size || hex.EncodeToString(fullHash.Sum(nil)) != m.Hash {
-			return fmt.Errorf("hash/tamanho final do arquivo diferente")
-		}
-		return nil
-	})
-}
-func (c Client) Delete(ctx context.Context, manifestPath string) error {
-	lock, err := lockManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	m, err := LoadManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-	if m.State == "deleted" {
-		return nil
-	}
-	m.State = "deleting"
-	if err = saveManifest(manifestPath, m, false); err != nil {
-		return err
-	}
-	var failures []error
-	for _, b := range m.Blocks {
-		op, e := NewID()
-		if e != nil {
-			return e
-		}
-		for _, r := range b.Replicas {
-			call, cancel := context.WithTimeout(ctx, c.timeout())
-			conn, api, e := c.connect(call, r)
-			if e == nil {
-				ack, deleteErr := api.DeleteBlock(call, &pb.DeleteRequest{OperationId: op, BlockId: b.BlockID, Version: b.Version})
-				e = deleteErr
-				if e == nil && ack.NodeId != r.NodeID {
-					e = fmt.Errorf("ACK inválido")
-				}
-				conn.Close()
-			}
-			cancel()
-			if e != nil {
-				failures = append(failures, fmt.Errorf("%s/%s: %w", r.NodeID, b.BlockID, e))
-			}
-		}
-	}
-	if len(failures) > 0 {
-		return fmt.Errorf("remoção pendente; repita delete quando os nós voltarem: %w", errors.Join(failures...))
-	}
-	m.State = "deleted"
-	return saveManifest(manifestPath, m, false)
+// Config controla o comportamento do cliente.
+type Config struct {
+	// MasterAddr é o host:porta do ClientService no mestre.
+	MasterAddr string
+
+	// BlockSize é o tamanho dos blocos no upload (padrão: 4 MiB).
+	BlockSize int64
+
+	// ReplicationFactor pedido ao mestre (0 = padrão do mestre).
+	ReplicationFactor uint32
+
+	// Parallelism é o número de blocos transferidos ao mesmo tempo.
+	Parallelism int
+
+	// MinReplicas é o mínimo de réplicas que precisam confirmar cada bloco
+	// para o upload ser aceito (padrão: 1). O mestre recebe no commit a lista
+	// das réplicas que confirmaram e pode re-replicar as que faltaram.
+	MinReplicas int
+
+	// RPCTimeout é o limite de cada chamada a um nó ou ao mestre.
+	RPCTimeout time.Duration
+
+	// Retries é o número de tentativas extras por réplica em falhas
+	// transitórias (Unavailable, DeadlineExceeded...).
+	Retries int
+
+	// Progress, se não for nil, é chamado a cada bloco concluído.
+	Progress func(done, total int)
+
+	// Chave AES-256 (32 bytes). Se vazia, criptografia desligada.
+	EncryptionKey []byte
 }
 
-// Repara uma das localizações existentes. Não altera o manifesto nem transfere
-// os bytes através do CLI; pede que uma origem válida os envie ao destino.
-func (c Client) Repair(ctx context.Context, manifestPath, targetNodeID string) error {
-	m, err := LoadManifest(manifestPath)
-	if err != nil {
-		return err
+func (c *Config) setDefaults() {
+	if c.BlockSize == 0 {
+		c.BlockSize = DefaultBlockSize
+		if len(c.EncryptionKey) > 0 {
+			c.BlockSize -= gcmOverhead
+		}
 	}
-	if m.State != "complete" {
-		return fmt.Errorf("manifesto não está complete")
+	if c.Parallelism <= 0 {
+		c.Parallelism = 4
 	}
-	for _, b := range m.Blocks {
-		exists := false
-		for _, r := range b.Replicas {
-			if r.NodeID == targetNodeID {
-				exists = true
-			}
-		}
-		if !exists {
-			return fmt.Errorf("destino %s não consta no manifesto", targetNodeID)
-		}
-		op, err := NewID()
-		if err != nil {
-			return err
-		}
-		var failures []error
-		copied := false
-		for _, source := range b.Replicas {
-			if source.NodeID == targetNodeID {
-				continue
-			}
-			call, cancel := context.WithTimeout(ctx, c.timeout())
-			conn, api, e := c.connect(call, source)
-			if e == nil {
-				ack, copyErr := api.CopyBlock(call, &pb.CopyRequest{OperationId: op, BlockId: b.BlockID, Version: b.Version, TargetNodeId: targetNodeID})
-				e = copyErr
-				if e == nil && (ack.NodeId != targetNodeID || ack.BlockId != b.BlockID || ack.Version != b.Version || ack.Size != b.Size || ack.Hash != b.Hash) {
-					e = fmt.Errorf("ACK da cópia inválido")
-				}
-				conn.Close()
-			}
-			cancel()
-			if e == nil {
-				copied = true
-				break
-			}
-			failures = append(failures, e)
-		}
-		if !copied {
-			return fmt.Errorf("não foi possível reparar %s: %w", b.BlockID, errors.Join(failures...))
-		}
+	if c.MinReplicas <= 0 {
+		c.MinReplicas = 1
+	}
+	if c.RPCTimeout <= 0 {
+		c.RPCTimeout = 30 * time.Second
+	}
+	if c.Retries < 0 {
+		c.Retries = 0
+	}
+}
+
+func (c *Config) validate() error {
+	if c.MasterAddr == "" {
+		return errors.New("endereço do mestre não informado")
+	}
+	if len(c.EncryptionKey) > 0 && len(c.EncryptionKey) != 32 {
+		return errors.New("a chave de criptografia deve ter exatamente 32 bytes")
+	}
+
+	maxAllowed := int64(MaxBlockSize)
+	if len(c.EncryptionKey) > 0 {
+		maxAllowed -= gcmOverhead
+	}
+	if c.BlockSize < 1 || c.BlockSize > maxAllowed {
+		return fmt.Errorf("block size deve estar entre 1 e %d bytes", maxAllowed)
 	}
 	return nil
 }
-func (c Client) Status(ctx context.Context, node Replica) (*pb.StatusResponse, error) {
-	call, cancel := context.WithTimeout(ctx, c.timeout())
-	defer cancel()
-	conn, api, err := c.connect(call, node)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	return api.Status(call, &pb.StatusRequest{})
+
+// Client conversa com o mestre e com os nós de armazenamento.
+// É seguro para uso concorrente.
+type Client struct {
+	cfg    Config
+	master pb.ClientServiceClient
+
+	masterConn *grpc.ClientConn
+
+	mu    sync.Mutex
+	nodes map[string]*grpc.ClientConn // address -> conexão
 }
-func (c Client) Scrub(ctx context.Context, node Replica) (*pb.ScrubResponse, error) {
-	op, err := NewID()
-	if err != nil {
+
+// New cria um cliente. As conexões gRPC são preguiçosas: nada é
+// contatado até a primeira operação.
+func New(cfg Config) (*Client, error) {
+	cfg.setDefaults()
+	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	call, cancel := context.WithTimeout(ctx, c.timeout())
+
+	conn, err := dial(cfg.MasterAddr)
+	if err != nil {
+		return nil, fmt.Errorf("conectar ao mestre %s: %w", cfg.MasterAddr, err)
+	}
+
+	return &Client{
+		cfg:        cfg,
+		master:     pb.NewClientServiceClient(conn),
+		masterConn: conn,
+		nodes:      make(map[string]*grpc.ClientConn),
+	}, nil
+}
+
+// Close encerra todas as conexões abertas.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	errs := []error{c.masterConn.Close()}
+	for addr, conn := range c.nodes {
+		errs = append(errs, conn.Close())
+		delete(c.nodes, addr)
+	}
+	return errors.Join(errs...)
+}
+
+func dial(addr string) (*grpc.ClientConn, error) {
+	return grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(maxMessageBytes),
+			grpc.MaxCallSendMsgSize(maxMessageBytes),
+		),
+	)
+}
+
+// storage devolve (e reaproveita) a conexão com um nó.
+func (c *Client) storage(addr string) (pb.StorageServiceClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if conn, ok := c.nodes[addr]; ok {
+		return pb.NewStorageServiceClient(conn), nil
+	}
+
+	conn, err := dial(addr)
+	if err != nil {
+		return nil, fmt.Errorf("conectar ao nó %s: %w", addr, err)
+	}
+	c.nodes[addr] = conn
+	return pb.NewStorageServiceClient(conn), nil
+}
+
+func (c *Client) rpcContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.cfg.RPCTimeout)
+}
+
+// List devolve os arquivos cujo caminho começa com prefix.
+func (c *Client) List(ctx context.Context, prefix string) ([]*pb.FileInfo, error) {
+	ctx, cancel := c.rpcContext(ctx)
 	defer cancel()
-	conn, api, err := c.connect(call, node)
+
+	resp, err := c.master.ListFiles(ctx, &pb.ListFilesRequest{Prefix: prefix})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listar arquivos: %w", err)
 	}
-	defer conn.Close()
-	return api.Scrub(call, &pb.ScrubRequest{OperationId: op})
+	return resp.GetFiles(), nil
+}
+
+// Stat devolve os metadados e a localização dos blocos de um arquivo.
+func (c *Client) Stat(ctx context.Context, path string) (*pb.GetFileResponse, error) {
+	ctx, cancel := c.rpcContext(ctx)
+	defer cancel()
+
+	resp, err := c.master.GetFile(ctx, &pb.GetFileRequest{Path: path})
+	if err != nil {
+		return nil, fmt.Errorf("consultar %s: %w", path, err)
+	}
+	return resp, nil
+}
+
+// Delete pede ao mestre a remoção do arquivo. A remoção dos blocos nos
+// nós é responsabilidade do mestre.
+func (c *Client) Delete(ctx context.Context, path string) error {
+	ctx, cancel := c.rpcContext(ctx)
+	defer cancel()
+
+	resp, err := c.master.DeleteFile(ctx, &pb.DeleteFileRequest{Path: path})
+	if err != nil {
+		return fmt.Errorf("remover %s: %w", path, err)
+	}
+	if !resp.GetDeleted() {
+		return fmt.Errorf("remover %s: mestre não confirmou a remoção", path)
+	}
+	return nil
+}
+
+// Move renomeia ou move um arquivo ou diretório. Só altera metadados no
+// mestre: nenhum bloco é copiado.
+func (c *Client) Move(ctx context.Context, from, to string, overwrite bool) (*pb.FileInfo, error) {
+	ctx, cancel := c.rpcContext(ctx)
+	defer cancel()
+
+	resp, err := c.master.Move(ctx, &pb.MoveRequest{From: from, To: to, Overwrite: overwrite})
+	if err != nil {
+		return nil, fmt.Errorf("mover %s para %s: %w", from, to, err)
+	}
+	return resp.GetFile(), nil
+}
+
+// MakeDir cria um diretório. Com parents, cria também os intermediários.
+func (c *Client) MakeDir(ctx context.Context, path string, parents bool) error {
+	ctx, cancel := c.rpcContext(ctx)
+	defer cancel()
+
+	if _, err := c.master.MakeDir(ctx, &pb.MakeDirRequest{Path: path, Parents: parents}); err != nil {
+		return fmt.Errorf("criar diretório %s: %w", path, err)
+	}
+	return nil
+}
+
+// RemoveDir remove um diretório. Sem recursive, o diretório precisa estar vazio.
+func (c *Client) RemoveDir(ctx context.Context, path string, recursive bool) error {
+	ctx, cancel := c.rpcContext(ctx)
+	defer cancel()
+
+	resp, err := c.master.RemoveDir(ctx, &pb.RemoveDirRequest{Path: path, Recursive: recursive})
+	if err != nil {
+		return fmt.Errorf("remover diretório %s: %w", path, err)
+	}
+	if !resp.GetDeleted() {
+		return fmt.Errorf("remover diretório %s: mestre não confirmou a remoção", path)
+	}
+	return nil
+}
+
+func (c *Client) ReportCorruption(ctx context.Context, blockID, nodeID string) error {
+    ctx, cancel := c.rpcContext(ctx)
+    defer cancel()
+
+    _, err := c.master.ReportCorruption(ctx, &pb.ReportCorruptionRequest{
+        BlockId: blockID,
+        NodeId:  nodeID,
+    })
+    return err
 }
