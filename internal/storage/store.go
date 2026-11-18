@@ -5,273 +5,416 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 )
+
+var (
+	ErrNotFound    = errors.New("bloco não encontrado")
+	ErrConflict    = errors.New("identidade já possui outro conteúdo")
+	ErrCorrupt     = errors.New("réplica inválida")
+	ErrDeleted     = errors.New("bloco removido")
+	ErrUnavailable = errors.New("storage indisponível")
+)
+
+const MaxBlockBytes = 4 * 1024 * 1024
+const MaxRPCMessageBytes = MaxBlockBytes + 64*1024
 
 type BlockKey struct {
 	BlockID string
 	Version int
 }
-
-// Grava e lê blocos no disco
 type Store struct {
 	DataDir        string
 	blocks         map[BlockKey]Block
 	persistenceErr error
 	mu             sync.Mutex
+	lockFile       *os.File
+	closed         bool
+	// Apenas testes internos usam este ponto de falha.
+	failpoint func(string) error
 }
 
+// Um único processo por diretório. Implementação destinada ao Linux.
 func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {
-		return nil, errors.New("diretorio de dados vazio")
+		return nil, fmt.Errorf("diretório de dados vazio")
 	}
-
-	absDir, err := filepath.Abs(dataDir)
-	
+	abs, err := filepath.Abs(dataDir)
 	if err != nil {
-		return nil, fmt.Errorf("resolver diretorio: %w",err)
-	}
-
-	if err:= os.MkdirAll(absDir,0750); err != nil {
-		return nil, fmt.Errorf("criar diretorio %q: %w", absDir, err)
-	}
-
-	s := &Store{
-		DataDir: absDir,
-		blocks:  make(map[BlockKey]Block),
-	}
-
-	if err := s.loadSnapshot(); err != nil {
 		return nil, err
 	}
-
+	if err = os.MkdirAll(abs, 0750); err != nil {
+		return nil, err
+	}
+	for _, dir := range []string{abs, filepath.Join(abs, "tmp"), filepath.Join(abs, "quarantine")} {
+		if err = os.MkdirAll(dir, 0750); err != nil {
+			return nil, err
+		}
+		info, e := os.Lstat(dir)
+		if e != nil {
+			return nil, e
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("diretório inválido: %s", dir)
+		}
+	}
+	var rootStat syscall.Stat_t
+	if err = syscall.Stat(abs, &rootStat); err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"tmp", "quarantine"} {
+		var subStat syscall.Stat_t
+		if err = syscall.Stat(filepath.Join(abs, name), &subStat); err != nil {
+			return nil, err
+		}
+		if rootStat.Dev != subStat.Dev {
+			return nil, fmt.Errorf("%s deve estar no mesmo sistema de arquivos de DATA_DIR", name)
+		}
+	}
+	fd, err := syscall.Open(filepath.Join(abs, ".lock"), syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, err
+	}
+	lock := os.NewFile(uintptr(fd), "storage-lock")
+	if err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("DATA_DIR já está em uso: %w", err)
+	}
+	s := &Store{DataDir: abs, blocks: make(map[BlockKey]Block), lockFile: lock}
+	if err = s.loadSnapshot(); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
-
 }
-
-func (s *Store) blockPath(b *Block) (string, error) {
-	if b == nil {
-		return "", errors.New("bloco ausente")
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
 	}
-
-	if !blockIDPattern.MatchString(b.BlockID) {
-		return "", errors.New("BlockID invalido")
-	}
-
-	if b.Version < 1 {
-		return "", errors.New("Versao invalida")
-	}
-
-	name := b.BlockID + "-v" + strconv.Itoa(b.Version) + ".blk"
-	return filepath.Join(s.DataDir,name), nil
+	s.closed = true
+	return s.lockFile.Close() // Libera flock, inclusive na morte do processo.
 }
-
-func validateContent(b *Block, data []byte) error {
-	if int64(len(data)) != b.Size {
-		return fmt.Errorf("tamanho diferente: esperado %d, recebido %d", b.Size, len(data))
+func (s *Store) ready() error {
+	if s.closed {
+		return ErrUnavailable
 	}
-
-	sum := sha256.Sum256(data)
-	atualHash := hex.EncodeToString(sum[:])
-
-	if atualHash != b.Hash {
-		return errors.New("SHA-256 diferente")
+	if s.persistenceErr != nil {
+		return fmt.Errorf("%w: reinicie após corrigir a causa: %v", ErrUnavailable, s.persistenceErr)
 	}
-
 	return nil
 }
+func (s *Store) trip(stage string) error {
+	if s.failpoint != nil {
+		return s.failpoint(stage)
+	}
+	return nil
+}
+func (s *Store) blockPath(b *Block) (string, error) {
+	if b == nil || !blockIDPattern.MatchString(b.BlockID) || b.Version < 1 {
+		return "", fmt.Errorf("identidade de bloco inválida")
+	}
+	return filepath.Join(s.DataDir, b.BlockID+"-v"+strconv.Itoa(b.Version)+".blk"), nil
+}
+func validateContent(b *Block, data []byte) error {
+	if int64(len(data)) != b.Size {
+		return fmt.Errorf("tamanho diferente")
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != b.Hash {
+		return fmt.Errorf("SHA-256 diferente")
+	}
+	return nil
+}
+func validateMetadata(b Block) error {
+	if !blockIDPattern.MatchString(b.BlockID) || b.Version < 1 || b.Size < 0 || b.Size > MaxBlockBytes {
+		return fmt.Errorf("metadados inválidos")
+	}
+	hash, err := hex.DecodeString(b.Hash)
+	if err != nil || len(hash) != sha256.Size || hex.EncodeToString(hash) != b.Hash {
+		return fmt.Errorf("SHA-256 inválido")
+	}
+	return nil
+}
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Sync(), f.Close())
+}
 
+// Limita memória e não segue links simbólicos nos arquivos de blocos.
+func readContent(path string) ([]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > MaxBlockBytes {
+		return nil, fmt.Errorf("arquivo inválido ou grande demais")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, MaxBlockBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxBlockBytes {
+		return nil, fmt.Errorf("bloco grande demais")
+	}
+	return data, nil
+}
 
 func (s *Store) SaveBlock(b *Block, data []byte) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if s.persistenceErr != nil {
-		return fmt.Errorf(
-			"storage bloqueado após falha de persistência: %w",
-			s.persistenceErr,
-		)
+	if err = s.ready(); err != nil {
+		return err
 	}
-
-	// pega o path do bloco
 	path, err := s.blockPath(b)
 	if err != nil {
 		return err
 	}
-
-	// valida o bloco
-	if err := validateContent(b, data); err != nil {
+	if err = validateMetadata(*b); err != nil {
 		return err
 	}
-
-	key := BlockKey{
-	BlockID: b.BlockID,
-	Version:  b.Version,
+	if err = validateContent(b, data); err != nil {
+		return err
 	}
-
-
-	if existing, ok := s.blocks[key]; ok {
-		if existing.Size != b.Size || existing.Hash != b.Hash {
-			return fmt.Errorf(
-				"conflito: bloco %s versão %d já possui outro conteúdo",
-				b.BlockID, b.Version,
-			)
+	key := BlockKey{b.BlockID, b.Version}
+	if old, ok := s.blocks[key]; ok {
+		if old.State == DELETING || old.State == DELETED {
+			return ErrDeleted
 		}
-
-		if existing.State != VALID {
-			return fmt.Errorf(
-				"bloco %s versão %d não está VALID",
-				b.BlockID, b.Version,
-			)
+		if old.Size != b.Size || old.Hash != b.Hash {
+			return ErrConflict
 		}
-
-		// Confere a réplica antes de aceitar uma repetição.
-		storedData, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("ler réplica existente: %w", err)
+		if old.State == VALID {
+			stored, e := readContent(path)
+			if e == nil && validateContent(&old, stored) == nil {
+				b.State = VALID
+				return nil
+			}
 		}
-
-		if err := validateContent(&existing, storedData); err != nil {
-			existing.State = CORRUPT
-			persistErr := s.persistBlockLocked(existing)
-			return errors.Join(
-				fmt.Errorf("réplica existente corrompida: %w", err),
-				persistErr,
-			)
-		}
-
-		b.State = VALID
-		return nil
+		// Mesma identidade e mesmo hash podem reparar CORRUPT/WRITING.
 	}
-
-	// verifica se ja existe um path
-	if _, err := os.Lstat(path); err == nil {
-		return fmt.Errorf("bloco já existe: %s", b.BlockID)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("consultar destino: %w", err)
+	// Snapshot com intenção durável ANTES de publicar os bytes.
+	intent := *b
+	intent.State = WRITING
+	if err = s.persistBlockLocked(intent); err != nil {
+		return err
 	}
-
-	b.State = WRITING
-
-	// Mesmo diretório: temporário e destino ficam no mesmo filesystem
-	f, err := os.CreateTemp(s.DataDir, ".upload-*")
-	if err != nil {
-		return fmt.Errorf("criar temporário: %w", err)
-	}
-
-	tempPath := f.Name()
-	closed := false
-	published := false
-
 	defer func() {
-		if !closed {
-			if closeErr := f.Close(); closeErr != nil {
-				err = errors.Join(err, fmt.Errorf(
-					"fechar temporário: %w", closeErr,
-				))
-			}
-		}
-
-		if !published {
-			if removeErr := os.Remove(tempPath); removeErr != nil {
-				if !errors.Is(removeErr, os.ErrNotExist) {
-					err = errors.Join(err, fmt.Errorf(
-						"remover temporário: %w", removeErr,
-					))
-				}
-			}
+		if err != nil {
+			s.persistenceErr = err
 		}
 	}()
-
-	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("gravar bloco: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sincronizar bloco: %w", err)
-	}
-
-	closeErr := f.Close()
-	closed = true
-	if closeErr != nil {
-		return fmt.Errorf("fechar bloco: %w", closeErr)
-	}
-
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("publicar bloco: %w", err)
-	}
-	published = true
-
-	dir, err := os.Open(s.DataDir)
-	if err != nil {
-		return fmt.Errorf("abrir diretório para sincronização: %w", err)
-	}
-
-	syncErr := dir.Sync()
-	dirCloseErr := dir.Close()
-	if err := errors.Join(syncErr, dirCloseErr); err != nil {
-		return fmt.Errorf("persistir publicação do bloco: %w", err)
-	}
-
-	committed := *b
-	committed.State = VALID
-
-	if err := s.persistBlockLocked(committed); err != nil {
+	if err = s.trip("put-intent"); err != nil {
 		return err
 	}
-
+	tmpDir := filepath.Join(s.DataDir, "tmp")
+	f, err := os.CreateTemp(tmpDir, "upload-*")
+	if err != nil {
+		return err
+	}
+	temp := f.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(temp)
+	}()
+	n, err := f.Write(data)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	err = f.Close()
+	closed = true
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(temp, path); err != nil {
+		return err
+	}
+	if err = syncDir(tmpDir); err != nil {
+		return err
+	}
+	if err = syncDir(s.DataDir); err != nil {
+		return err
+	}
+	if err = s.trip("put-published"); err != nil {
+		return err
+	}
+	intent.State = VALID
+	if err = s.persistBlockLocked(intent); err != nil {
+		return err
+	}
 	b.State = VALID
 	return nil
 }
 
-func (s *Store) ReadBlock(id string, versao int) ([]byte, error) {
+func (s *Store) ReadBlock(id string, version int) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	key := BlockKey{
-		BlockID: id,
-		Version:  versao,
+	if err := s.ready(); err != nil {
+		return nil, err
 	}
-
-	b, ok := s.blocks[key]
+	b, ok := s.blocks[BlockKey{id, version}]
 	if !ok {
-		return nil, fmt.Errorf(
-			"bloco %s versão %d não encontrado no inventário",
-			id, versao,
-		)
+		return nil, ErrNotFound
 	}
-
+	if b.State == DELETED || b.State == DELETING {
+		return nil, ErrDeleted
+	}
 	if b.State != VALID {
-		return nil, fmt.Errorf(
-			"bloco %s versão %d não está VALID",
-			id, versao,
-		)
+		return nil, ErrCorrupt
 	}
-
 	path, err := s.blockPath(&b)
 	if err != nil {
 		return nil, err
 	}
-
-	data, err := os.ReadFile(path)
+	data, err := readContent(path)
+	if err == nil {
+		err = validateContent(&b, data)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("ler bloco: %w", err)
-	}
-
-	if err := validateContent(&b, data); err != nil {
 		b.State = CORRUPT
-		persistErr := s.persistBlockLocked(b)
-		return nil, errors.Join(
-			fmt.Errorf(
-				"bloco %s versão %d corrompido: %w",
-				id, versao, err,
-			),
-			persistErr,
-		)
+		return nil, errors.Join(fmt.Errorf("%w: %v", ErrCorrupt, err), s.persistBlockLocked(b))
 	}
-
 	return data, nil
+}
+
+func (s *Store) DeleteBlock(id string, version int) (err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.ready(); err != nil {
+		return err
+	}
+	b := Block{BlockID: id, Version: version}
+	path, err := s.blockPath(&b)
+	if err != nil {
+		return err
+	}
+	if old, ok := s.blocks[BlockKey{id, version}]; ok {
+		b = old
+		if b.State == DELETED {
+			return nil
+		}
+	}
+	// Mesmo ausente ganha tombstone, bloqueando um Put atrasado.
+	b.State = DELETING
+	if err = s.persistBlockLocked(b); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			s.persistenceErr = err
+		}
+	}()
+	if err = s.trip("delete-intent"); err != nil {
+		return err
+	}
+	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err = syncDir(s.DataDir); err != nil {
+		return err
+	}
+	if err = s.trip("delete-unlinked"); err != nil {
+		return err
+	}
+	b.State = DELETED
+	return s.persistBlockLocked(b)
+}
+
+type ScrubResult struct{ Checked, Corrupt uint64 }
+
+func (s *Store) Scrub() (ScrubResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var result ScrubResult
+	if err := s.ready(); err != nil {
+		return result, err
+	}
+	next := s.cloneBlocks()
+	changed := false
+	for key, b := range next {
+		if b.State != VALID && b.State != CORRUPT {
+			continue
+		}
+		result.Checked++
+		path, _ := s.blockPath(&b)
+		data, err := readContent(path)
+		if err == nil {
+			err = validateContent(&b, data)
+		}
+		// CORRUPT só volta a VALID por Put verificado ou recuperação de WRITING.
+		if err != nil && b.State == VALID {
+			b.State = CORRUPT
+			next[key] = b
+			changed = true
+		}
+		if b.State == CORRUPT {
+			result.Corrupt++
+		}
+	}
+	if changed {
+		return result, s.commitLocked(next)
+	}
+	return result, nil
+}
+
+type StoreStatus struct {
+	Valid, Corrupt, Writing, Deleting, Deleted, ValidBytes, FreeBytes uint64
+	Writable                                                          bool
+	Error                                                             string
+}
+
+func (s *Store) Status() StoreStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := StoreStatus{Writable: s.ready() == nil}
+	if err := s.ready(); err != nil {
+		r.Error = err.Error()
+	}
+	for _, b := range s.blocks {
+		switch b.State {
+		case VALID:
+			r.Valid++
+			r.ValidBytes += uint64(b.Size)
+		case CORRUPT:
+			r.Corrupt++
+		case WRITING:
+			r.Writing++
+		case DELETING:
+			r.Deleting++
+		case DELETED:
+			r.Deleted++
+		}
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(s.DataDir, &stat); err != nil {
+		r.Writable = false
+		r.Error = err.Error()
+	} else {
+		r.FreeBytes = stat.Bavail * uint64(stat.Bsize)
+	}
+	return r
 }

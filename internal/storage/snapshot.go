@@ -1,13 +1,13 @@
 package storage
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type Snapshot struct {
@@ -15,18 +15,31 @@ type Snapshot struct {
 	Blocks        []Block `json:"blocks"`
 }
 
-// O chamador deve manter s.mu bloqueado.
+func (s *Store) cloneBlocks() map[BlockKey]Block {
+	next := make(map[BlockKey]Block, len(s.blocks)+1)
+	for key, b := range s.blocks {
+		next[key] = b
+	}
+	return next
+}
+func (s *Store) commitLocked(next map[BlockKey]Block) error {
+	if err := s.saveSnapshotLocked(next); err != nil {
+		s.persistenceErr = err
+		return fmt.Errorf("persistir inventário: %w", err)
+	}
+	s.blocks = next
+	return nil
+}
+func (s *Store) persistBlockLocked(b Block) error {
+	next := s.cloneBlocks()
+	next[BlockKey{b.BlockID, b.Version}] = b
+	return s.commitLocked(next)
+}
 func (s *Store) saveSnapshotLocked(blocks map[BlockKey]Block) (err error) {
-	snapshot := Snapshot{
-		FormatVersion: 1,
-		Blocks:        make([]Block, 0, len(blocks)),
+	snapshot := Snapshot{FormatVersion: 2, Blocks: make([]Block, 0, len(blocks))}
+	for _, b := range blocks {
+		snapshot.Blocks = append(snapshot.Blocks, b)
 	}
-
-	for _, block := range blocks {
-		snapshot.Blocks = append(snapshot.Blocks, block)
-	}
-
-	// Mantém uma ordem previsível no JSON.
 	sort.Slice(snapshot.Blocks, func(i, j int) bool {
 		a, b := snapshot.Blocks[i], snapshot.Blocks[j]
 		if a.BlockID == b.BlockID {
@@ -34,201 +47,148 @@ func (s *Store) saveSnapshotLocked(blocks map[BlockKey]Block) (err error) {
 		}
 		return a.BlockID < b.BlockID
 	})
-
-	f, err := os.CreateTemp(s.DataDir, ".snapshot-*")
+	dir := filepath.Join(s.DataDir, "tmp")
+	f, err := os.CreateTemp(dir, "snapshot-*")
 	if err != nil {
-		return fmt.Errorf("criar snapshot temporário: %w", err)
+		return err
 	}
-
-	tempPath := f.Name()
+	name := f.Name()
 	closed := false
-	published := false
-
 	defer func() {
 		if !closed {
-			if closeErr := f.Close(); closeErr != nil {
-				err = errors.Join(err, closeErr)
-			}
+			_ = f.Close()
 		}
-
-		if !published {
-			if removeErr := os.Remove(tempPath); removeErr != nil &&
-				!errors.Is(removeErr, os.ErrNotExist) {
-				err = errors.Join(err, removeErr)
-			}
-		}
+		_ = os.Remove(name)
 	}()
-
 	encoder := json.NewEncoder(f)
 	encoder.SetIndent("", "  ")
-
-	if err := encoder.Encode(snapshot); err != nil {
-		return fmt.Errorf("serializar snapshot: %w", err)
+	if err = encoder.Encode(snapshot); err != nil {
+		return err
 	}
-
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sincronizar snapshot: %w", err)
+	if err = f.Sync(); err != nil {
+		return err
 	}
-
-	closeErr := f.Close()
+	err = f.Close()
 	closed = true
-	if closeErr != nil {
-		return fmt.Errorf("fechar snapshot: %w", closeErr)
-	}
-
-	path := filepath.Join(s.DataDir, "snapshot.json")
-
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("publicar snapshot: %w", err)
-	}
-	published = true
-
-	dir, err := os.Open(s.DataDir)
 	if err != nil {
-		return fmt.Errorf("abrir diretório do snapshot: %w", err)
+		return err
 	}
-
-	syncErr := dir.Sync()
-	dirCloseErr := dir.Close()
-
-	if err := errors.Join(syncErr, dirCloseErr); err != nil {
-		return fmt.Errorf("sincronizar diretório do snapshot: %w", err)
+	if err = os.Rename(name, filepath.Join(s.DataDir, "snapshot.json")); err != nil {
+		return err
 	}
-
-	return nil
+	return errors.Join(syncDir(dir), syncDir(s.DataDir))
 }
 
-// Persiste uma cópia atualizada antes de substituir o mapa em memória.
-// O chamador deve manter s.mu bloqueado.
-func (s *Store) persistBlockLocked(b Block) error {
-	next := make(map[BlockKey]Block, len(s.blocks)+1)
-
-	for key, block := range s.blocks {
-		next[key] = block
-	}
-
-	key := BlockKey{BlockID: b.BlockID, Version: b.Version}
-	next[key] = b
-
-	if err := s.saveSnapshotLocked(next); err != nil {
-		s.persistenceErr = err
-		return fmt.Errorf("persistir inventário: %w", err)
-	}
-
-	s.blocks = next
-	return nil
-}
-
-// Executada na inicialização, antes de compartilhar o Store.
+// Carrega v1 antigo e v2 com intenções/tombstones. JSON inválido falha fechado.
 func (s *Store) loadSnapshot() error {
-	path := filepath.Join(s.DataDir, "snapshot.json")
-
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		// Um nó novo pode começar vazio. Blocos preexistentes
-		// sem snapshot precisam de reconciliação.
-		return s.checkUntrackedBlocks()
+	data, err := os.ReadFile(filepath.Join(s.DataDir, "snapshot.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	if err != nil {
-		return fmt.Errorf("ler snapshot: %w", err)
-	}
-
-	var snapshot Snapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return fmt.Errorf("snapshot inválido: %w", err)
-	}
-
-	if snapshot.FormatVersion != 1 {
-		return fmt.Errorf(
-			"versão de snapshot não suportada: %d",
-			snapshot.FormatVersion,
-		)
-	}
-
-	loaded := make(map[BlockKey]Block, len(snapshot.Blocks))
-
-	for _, b := range snapshot.Blocks {
-		blockPath, err := s.blockPath(&b)
-		if err != nil {
-			return fmt.Errorf("metadados inválidos: %w", err)
+	if err == nil {
+		var snapshot Snapshot
+		if err = json.Unmarshal(data, &snapshot); err != nil {
+			return fmt.Errorf("snapshot inválido; restaure uma cópia confiável: %w", err)
 		}
-
-		hashBytes, err := hex.DecodeString(b.Hash)
-		if err != nil || len(hashBytes) != 32 {
-			return fmt.Errorf("hash inválido no bloco %s", b.BlockID)
+		if snapshot.FormatVersion != 1 && snapshot.FormatVersion != 2 {
+			return fmt.Errorf("versão de snapshot não suportada")
 		}
-		b.Hash = hex.EncodeToString(hashBytes)
-
-		if b.Size < 0 {
-			return fmt.Errorf("tamanho negativo no bloco %s", b.BlockID)
-		}
-
-		// Esta versão só persiste estados estáveis.
-		if b.State != VALID && b.State != CORRUPT {
-			return fmt.Errorf(
-				"estado não recuperável no bloco %s: %d",
-				b.BlockID, b.State,
-			)
-		}
-
-		key := BlockKey{BlockID: b.BlockID, Version: b.Version}
-		if _, exists := loaded[key]; exists {
-			return fmt.Errorf(
-				"entrada duplicada: %s versão %d",
-				b.BlockID, b.Version,
-			)
-		}
-
-		if b.State == VALID {
-			content, err := os.ReadFile(blockPath)
-			if err != nil {
-				return fmt.Errorf(
-					"recuperar bloco %s: %w", b.BlockID, err,
-				)
+		for _, b := range snapshot.Blocks {
+			if _, err = s.blockPath(&b); err != nil {
+				return err
 			}
-
-			if err := validateContent(&b, content); err != nil {
-				return fmt.Errorf(
-					"bloco %s inválido na recuperação: %w",
-					b.BlockID, err,
-				)
+			if b.State < WRITING || b.State > DELETED {
+				return fmt.Errorf("estado inválido")
+			}
+			if b.State != DELETING && b.State != DELETED {
+				if err = validateMetadata(b); err != nil {
+					return err
+				}
+			}
+			key := BlockKey{b.BlockID, b.Version}
+			if _, exists := s.blocks[key]; exists {
+				return fmt.Errorf("identidade duplicada no snapshot")
+			}
+			s.blocks[key] = b
+		}
+	}
+	// Recuperação é idempotente, inclusive se o processo morrer novamente aqui.
+	for key, b := range s.blocks {
+		path, _ := s.blockPath(&b)
+		switch b.State {
+		case DELETING, DELETED:
+			if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err = syncDir(s.DataDir); err != nil {
+				return err
+			}
+			b.State = DELETED
+		case VALID, WRITING:
+			content, e := readContent(path)
+			if e == nil {
+				e = validateContent(&b, content)
+			}
+			if e != nil {
+				b.State = CORRUPT
+			} else {
+				b.State = VALID
 			}
 		}
-
-		loaded[key] = b
+		s.blocks[key] = b
 	}
-
-	s.blocks = loaded
-	return s.checkUntrackedBlocks()
+	if err = s.reconcileFiles(); err != nil {
+		return err
+	}
+	// Confirma que o diretório é utilizável e persiste alterações da recuperação.
+	return s.saveSnapshotLocked(s.blocks)
 }
-
-// Não adota automaticamente arquivos cujo hash esperado foi perdido.
-func (s *Store) checkUntrackedBlocks() error {
-	expected := make(map[string]bool, len(s.blocks))
-
+func (s *Store) reconcileFiles() error {
+	expected := make(map[string]bool)
 	for _, b := range s.blocks {
-		path, err := s.blockPath(&b)
-		if err != nil {
-			return err
-		}
+		path, _ := s.blockPath(&b)
 		expected[filepath.Base(path)] = true
 	}
-
 	entries, err := os.ReadDir(s.DataDir)
 	if err != nil {
-		return fmt.Errorf("listar diretório de dados: %w", err)
+		return err
 	}
-
 	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) == ".blk" &&
-			!expected[entry.Name()] {
-			return fmt.Errorf(
-				"bloco sem registro no snapshot: %s; "+
-					"reconciliação necessária",
-				entry.Name(),
-			)
+		name := entry.Name()
+		path := filepath.Join(s.DataDir, name)
+		if strings.HasPrefix(name, ".upload-") || strings.HasPrefix(name, ".snapshot-") {
+			if !entry.IsDir() {
+				if err = os.Remove(path); err != nil {
+					return err
+				}
+			}
+		}
+		if filepath.Ext(name) == ".blk" && !expected[name] {
+			// Não inventa hash esperado para um órfão e não o serve.
+			parent := filepath.Join(s.DataDir, "quarantine")
+			dir, e := os.MkdirTemp(parent, "orphan-*")
+			if e != nil {
+				return e
+			}
+			if err = os.Rename(path, filepath.Join(dir, name)); err != nil {
+				return err
+			}
+			if err = errors.Join(syncDir(dir), syncDir(parent), syncDir(s.DataDir)); err != nil {
+				return err
+			}
 		}
 	}
-
-	return nil
+	tmp := filepath.Join(s.DataDir, "tmp")
+	entries, err = os.ReadDir(tmp)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && (strings.HasPrefix(entry.Name(), "upload-") || strings.HasPrefix(entry.Name(), "snapshot-")) {
+			if err = os.Remove(filepath.Join(tmp, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return errors.Join(syncDir(tmp), syncDir(s.DataDir))
 }

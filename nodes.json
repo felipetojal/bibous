@@ -1,0 +1,7 @@
+{
+  "nodes": [
+    {"node_id": "storage-a", "address": "127.0.0.1:8081"},
+    {"node_id": "storage-b", "address": "127.0.0.1:8082"},
+    {"node_id": "storage-c", "address": "127.0.0.1:8083"}
+  ]
+}
