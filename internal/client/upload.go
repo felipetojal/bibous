@@ -44,7 +44,7 @@ func (c *Client) Upload(
 		return nil, fmt.Errorf("%s não é um arquivo regular", localPath)
 	}
 
-	specs, size, fileHash, err := splitFile(f, c.cfg.BlockSize)
+	specs, size, fileHash, err := c.splitFile(f, c.cfg.BlockSize)
 	if err != nil {
 		return nil, err
 	}
@@ -59,11 +59,24 @@ func (c *Client) Upload(
 	err = forEach(ctx, len(plan), c.cfg.Parallelism, c.cfg.Progress,
 		func(ctx context.Context, i int) error {
 			block := plan[i]
+			
+			plainSize := block.GetSize()
+			if len(c.cfg.EncryptionKey) == 32 {
+				plainSize -= gcmOverhead
+			}
 
-			data := make([]byte, block.GetSize())
+			data := make([]byte, plainSize)
 			offset := int64(block.GetIndex()) * c.cfg.BlockSize
-			if _, err := f.ReadAt(data, offset); err != nil && !errors.Is(err, io.EOF) {
+			n, err := f.ReadAt(data, offset)
+			if err != nil && !errors.Is(err, io.EOF) {
 				return fmt.Errorf("ler bloco %d: %w", block.GetIndex(), err)
+			}
+			data = data[:n]
+			if len(c.cfg.EncryptionKey) == 32 {
+				data, err = encryptBlock(c.cfg.EncryptionKey, block.GetIndex(), data)
+				if err != nil {
+					return fmt.Errorf("cifrar bloco %d: %w", block.GetIndex(), err)
+				}
 			}
 			if sha256Hex(data) != block.GetHash() {
 				return fmt.Errorf(
